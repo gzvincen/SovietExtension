@@ -52,6 +52,7 @@ static void YMInstallGroupExitMonitorPatch(void);
 typedef enum {
     YMRevokeHookModePointer = 0,   // 4.1.9：写 off_91EAD20
     YMRevokeHookModeInline  = 1,   // 4.1.10：patch 局部指令点
+    YMRevokeHookModeBlockEntry = 2,// x86_64 MVP：直接 patch 撤回处理函数入口 return，阻断撤回（原消息保留）
 } YMRevokeHookMode;
 
 #pragma mark - MessageWrap 字段布局
@@ -121,6 +122,16 @@ typedef struct {
     YMRevokeHookMode hookMode;//4.1.10添加
 } YMWeChatAdaptProfile;
 
+/*
+ 地址表按 CPU 架构分开维护：
+   - arm64  切片的静态 VA 走 YMAdaptProfilesARM64
+   - x86_64 切片的静态 VA 走 YMAdaptProfilesX86_64
+ 同一份源码会被编译两次（universal），编译期用 #if 选中对应架构的地址表，
+ 运行期再按微信版本号匹配具体 profile。
+ MessageWrapLayout 在两种架构上一致（同为 LP64 / 同一套 C++ ABI 对齐规则），
+ 所以两张表的 .layout 内容相同。
+ */
+#if defined(__arm64__) || defined(__aarch64__)
 static const YMWeChatAdaptProfile YMAdaptProfiles[] = {
     {
         .displayName = "Mac WeChat 4.1.9.58 arm64 / 268602",
@@ -283,6 +294,73 @@ static const YMWeChatAdaptProfile YMAdaptProfiles[] = {
      },
      */
 };
+
+#elif defined(__x86_64__)
+
+/*
+ x86_64 地址表。
+ ⚠️ 下面所有 VA 都标记为 0，是 Phase 2 待逆向的占位值：
+    需要在 wechat.dylib 的 x86_64 切片里重新定位每个函数 / 指令点的静态 VA。
+ 在地址填好之前：
+   - YMProfileHasValidAddresses 会因为关键地址为 0 返回 NO，
+     所以防撤回 / 退群在 x86_64 上会被安全跳过，不会崩。
+   - 多开 patch 读到 0 地址也会打印 "address is zero, skip"。
+ 逆向顺序建议：多开 -> 防撤回函数入口 -> 退群监控 + inline callsite。
+ */
+static const YMWeChatAdaptProfile YMAdaptProfiles[] = {
+    {
+        .displayName = "Mac WeChat 4.1.10.53 x86_64 / 268853",
+
+        .bundleID = "com.tencent.xinWeChat",
+        .shortVersion = "4.1.10",
+        .buildVersion = "268853",
+
+        // Phase 2 防撤回：BlockEntry(sub_2B93F40 入口 return0) 已实测无效——
+        //   实际撤回显示路径不经过该函数区。真正的入站撤回处理函数尚未定位
+        //   （需反编译器；纯 CLI 在混淆+结构重排的 x86 切片上不可靠）。
+        //   暂置 0 → 防撤回在 x86 安全跳过，不影响多开/防更新。
+        .hookMode = YMRevokeHookModeInline,
+        .hookPointerVA = 0,
+
+        .rawMessageTemplateVA = 0,
+        .messageWrapFromRawVA = 0,
+        .messageWrapDestructVA = 0,
+        .insertPaySysMsgToSessionVA = 0,
+
+        // ✅ Phase 2 已逆向+结构指纹验证（NSRunningApplication 多实例检测）：
+        //    TryPrevent: 栈canary + mainBundle->bundleIdentifier->
+        //                runningApplicationsWithBundleIdentifier:->count + activateWithOptions:
+        //    ProcessCount: 同上但无 activate，直接返回 count
+        .YMMultiOpenTryPreventMultiInstanceVA = 0x1F3830, // arm64 对应 0x1C4EA8
+        .YMGetMainWeixinProcessCountVA = 0x4AD0F00,       // arm64 对应 0x449E2BC
+
+        .groupExitDBApplyVA = 0,
+        .groupExitFMessagePreVA = 0,
+        .groupExitUpdateSessionCacheVA = 0,
+
+        .revokeOriginCallsiteAfterQueryVA = 0,
+        .revokeOriginCallsiteContinueVA = 0,
+        .revokeOriginCallsiteZeroBranchVA = 0,
+        .revokeDeleteMessagesVA = 0,
+
+        // 布局与 arm64 一致（LP64 同一套 C++ ABI），运行期日志再二次确认。
+        .layout = {
+            .messageWrapSize = 616,
+
+            .remoteUserOrSessionOffset = 24,
+            .selfUserOffset = 48,
+
+            .createTimeMsOffset = 256,
+            .createTimeSecOffset = 276,
+
+            .contentOffset = 328,
+        },
+    },
+};
+
+#else
+#error "Unsupported CPU architecture for YMAdaptProfiles"
+#endif
 
 static const size_t YMAdaptProfilesCount = sizeof(YMAdaptProfiles) / sizeof(YMAdaptProfiles[0]);
 
@@ -513,9 +591,16 @@ static NSString *YMNSStringFromLibcppStringObject(const void *stringObject) {
 
 #pragma mark - Profile 匹配
 
-static BOOL YMProfileHasValidAddresses(const YMWeChatAdaptProfile *profile) {
+// 防撤回功能所需的完整地址是否就绪（base 函数 + 对应 hook 模式入口）。
+// 防撤回的安装路径会再各自自检，所以这里只用于判断“防撤回能不能跑”。
+static BOOL YMProfileHasAntiRevokeAddresses(const YMWeChatAdaptProfile *profile) {
     if (!profile) {
         return NO;
+    }
+
+    // BlockEntry：只 patch 撤回处理函数入口 return，不需要 base 函数 / 模板。
+    if (profile->hookMode == YMRevokeHookModeBlockEntry) {
+        return profile->hookPointerVA != 0;
     }
 
     BOOL baseOK = profile->rawMessageTemplateVA != 0 &&
@@ -539,6 +624,23 @@ static BOOL YMProfileHasValidAddresses(const YMWeChatAdaptProfile *profile) {
     }
 
     return NO;
+}
+
+// 多开功能所需地址是否就绪。
+static BOOL YMProfileHasMultiOpenAddresses(const YMWeChatAdaptProfile *profile) {
+    return profile && (profile->YMMultiOpenTryPreventMultiInstanceVA != 0 ||
+                       profile->YMGetMainWeixinProcessCountVA != 0);
+}
+
+/*
+ profile 只要能驱动“任意一个”功能就算可用（active）。
+ 这样在某架构上即便只逆向出了多开地址、防撤回地址还为 0，多开也能独立生效，
+ 而防撤回 / 退群会在各自安装路径里因地址为 0 安全跳过，不会崩。
+ arm64 的 profile 两类地址都齐全，行为不变。
+ */
+static BOOL YMProfileHasValidAddresses(const YMWeChatAdaptProfile *profile) {
+    return YMProfileHasAntiRevokeAddresses(profile) ||
+           YMProfileHasMultiOpenAddresses(profile);
 }
 
 static const YMWeChatAdaptProfile *YMFindAdaptProfileForCurrentWeChat(void) {
@@ -1031,21 +1133,88 @@ static BOOL YMProtectCodePage(uintptr_t address,
     return YES;
 }
 
+#pragma mark - 架构相关机器码发射器（arm64 / x86_64）
+
 /*
- ARM64 BOOL/int 强制返回 YES：
+ 统一的“返回 YES / 非零”桩代码。
+   arm64 (8B):  mov w0, #1 ; ret   -> 20 00 80 52 / C0 03 5F D6
+   x86_64 (6B): mov eax, 1 ; ret   -> B8 01 00 00 00 / C3
 
-   mov w0, #1
-   ret
-
- 机器码：
-   20 00 80 52
-   C0 03 5F D6
-
- 注意：
-   这里用 w0，不用 x0。
-   因为 sub_200730 里是 if (v85 & 1)，本质是 BOOL/int。
+ 用 w0 / eax 而不是 x0 / rax，因为这些检测点本质是 BOOL/int 返回
+ （反编译里是 if (v & 1)）。返回写入的字节数。
  */
-static BOOL YMPatchARM64ReturnYES(uintptr_t address, const char *name) {
+static size_t YMEmitReturnYESStub(uint8_t out[8]) {
+#if defined(__x86_64__)
+    static const uint8_t code[] = {0xB8, 0x01, 0x00, 0x00, 0x00, 0xC3};
+#elif defined(__arm64__) || defined(__aarch64__)
+    static const uint8_t code[] = {0x20, 0x00, 0x80, 0x52, 0xC0, 0x03, 0x5F, 0xD6};
+#else
+    #error "Unsupported CPU architecture"
+#endif
+    memcpy(out, code, sizeof(code));
+    return sizeof(code);
+}
+
+/*
+ “返回 0 ; ret” 桩代码。用于 BlockEntry 防撤回：直接让撤回处理函数入口返回 0
+ （目标函数本身就有合法返回 0 的路径），从而不执行任何撤回替换。
+   arm64 (8B):  mov w0, #0 ; ret   -> 00 00 80 52 / C0 03 5F D6
+   x86_64 (6B): mov eax, 0 ; ret   -> B8 00 00 00 00 / C3
+ */
+static size_t YMEmitReturnZeroStub(uint8_t out[8]) {
+#if defined(__x86_64__)
+    static const uint8_t code[] = {0xB8, 0x00, 0x00, 0x00, 0x00, 0xC3};
+#elif defined(__arm64__) || defined(__aarch64__)
+    static const uint8_t code[] = {0x00, 0x00, 0x80, 0x52, 0xC0, 0x03, 0x5F, 0xD6};
+#else
+    #error "Unsupported CPU architecture"
+#endif
+    memcpy(out, code, sizeof(code));
+    return sizeof(code);
+}
+
+/*
+ 统一的“绝对跳转到 targetAddress”跳板，固定占用 16 字节
+ （不足处用 NOP 补齐，让 save/restore 的原始字节区长度在两种架构上一致）。
+
+   arm64 (16B):  ldr x16, #8 ; br x16 ; .quad targetAddress
+                 50 00 00 58 / 00 02 1F D6 / target 8B
+   x86_64 (13B): movabs r11, targetAddress ; jmp r11 ; 然后 NOP 补到 16B
+                 49 BB target8B / 41 FF E3 / 90 90 90
+
+ x16 / r11 都是 ABI 允许随意使用的临时寄存器，不破坏入参寄存器
+ （arm64 的 x0/x1、x86_64 的 rdi/rsi），所以 hook 仍能拿到原始参数。
+ 原函数是被 call/BL 调用进来的，返回地址已在栈/LR 上，跳到 hook 后
+ hook 末尾 ret 会直接回到上层调用者。返回写入的字节数（恒为 16）。
+ */
+static size_t YMEmitAbsoluteJump(uintptr_t targetAddress, uint8_t out[16]) {
+#if defined(__x86_64__)
+    memset(out, 0x90, 16); // 先全部填 nop
+    out[0] = 0x49;         // movabs r11, imm64
+    out[1] = 0xBB;
+    memcpy(out + 2, &targetAddress, sizeof(targetAddress));
+    out[10] = 0x41;        // jmp r11
+    out[11] = 0xFF;
+    out[12] = 0xE3;
+#elif defined(__arm64__) || defined(__aarch64__)
+    uint32_t insnLdrX16 = 0x58000050; // ldr x16, #8
+    uint32_t insnBrX16  = 0xD61F0200; // br x16
+    memcpy(out + 0, &insnLdrX16, sizeof(insnLdrX16));
+    memcpy(out + 4, &insnBrX16, sizeof(insnBrX16));
+    memcpy(out + 8, &targetAddress, sizeof(targetAddress));
+#else
+    #error "Unsupported CPU architecture"
+#endif
+    return 16;
+}
+
+#pragma mark - 函数补丁
+
+/*
+ 把目标函数 patch 成直接返回 YES / 非零。
+ 用于多开检测点（tryPreventMultiInstance / GetMainWeixinProcessCount）。
+ */
+static BOOL YMPatchFunctionReturnYES(uintptr_t address, const char *name) {
     if (address == 0) {
         YMLog(@"%s patch failed: address is zero", name);
         return NO;
@@ -1053,39 +1222,36 @@ static BOOL YMPatchARM64ReturnYES(uintptr_t address, const char *name) {
 
     void *target = (void *)address;
 
-    uint32_t patch[2] = {
-        0x52800020, // mov w0, #1
-        0xD65F03C0  // ret
-    };
+    uint8_t patch[8] = {0};
+    size_t patchSize = YMEmitReturnYESStub(patch);
 
     YMPrintCodeBytes(name, "before", target);
 
-    uint32_t current[2] = {0};
-    memcpy(current, target, sizeof(current));
+    uint8_t current[8] = {0};
+    memcpy(current, target, patchSize);
 
-    if (current[0] == patch[0] && current[1] == patch[1]) {
+    if (memcmp(current, patch, patchSize) == 0) {
         YMLog(@"%s already patched, address=0x%lx", name, (unsigned long)address);
         return YES;
     }
 
     if (!YMProtectCodePage(address,
-                           sizeof(patch),
+                           patchSize,
                            VM_PROT_READ | VM_PROT_WRITE | VM_PROT_COPY,
                            name,
                            "RW|COPY")) {
         return NO;
     }
 
-    memcpy(target, patch, sizeof(patch));
+    memcpy(target, patch, patchSize);
 
     /*
-     写指令后必须清 i-cache。
-     否则 CPU 可能继续执行旧指令。
+     写指令后必须清 i-cache（arm64 必需；x86_64 上 sys_icache_invalidate 是安全空操作）。
      */
-    sys_icache_invalidate(target, sizeof(patch));
+    sys_icache_invalidate(target, patchSize);
 
     if (!YMProtectCodePage(address,
-                           sizeof(patch),
+                           patchSize,
                            VM_PROT_READ | VM_PROT_EXECUTE,
                            name,
                            "RX")) {
@@ -1094,10 +1260,10 @@ static BOOL YMPatchARM64ReturnYES(uintptr_t address, const char *name) {
 
     YMPrintCodeBytes(name, "after", target);
 
-    uint32_t check[2] = {0};
-    memcpy(check, target, sizeof(check));
+    uint8_t check[8] = {0};
+    memcpy(check, target, patchSize);
 
-    BOOL ok = check[0] == patch[0] && check[1] == patch[1];
+    BOOL ok = memcmp(check, patch, patchSize) == 0;
 
     YMLog(@"%s patch result=%@, address=0x%lx",
           name,
@@ -1108,28 +1274,70 @@ static BOOL YMPatchARM64ReturnYES(uintptr_t address, const char *name) {
 }
 
 /*
- 4.1.10
- ARM64 函数入口绝对跳转：
-
-   ldr x16, #8
-   br  x16
-   .quad hookAddress
-
- 机器码：
-   50 00 00 58
-   00 02 1F D6
-   hookAddress 8 bytes
-
- 说明：
-   1. x16 是临时寄存器，按 ABI 可以用。
-   2. 不改 x0/x1，所以 YMHandleSysMsgRevokeMsgHook(a1, a2) 能正常收到参数。
-   3. 原函数是被 BL 调用的，LR 已经是上层返回地址。
-      用 BR 跳到 hook，hook 最后 ret，会直接回到原调用者。
-   4. 这里不需要 trampoline，因为就是要阻止原撤回逻辑继续执行。
+ 把目标函数 patch 成直接返回 0（BlockEntry 防撤回）。
+ 与 YMPatchFunctionReturnYES 结构一致，只是写 return-0 桩。
  */
-static BOOL YMPatchARM64AbsoluteJump(uintptr_t address,
-                                     uintptr_t targetAddress,
-                                     const char *name) {
+static BOOL YMPatchFunctionReturnZero(uintptr_t address, const char *name) {
+    if (address == 0) {
+        YMLog(@"%s patch failed: address is zero", name);
+        return NO;
+    }
+
+    void *target = (void *)address;
+
+    uint8_t patch[8] = {0};
+    size_t patchSize = YMEmitReturnZeroStub(patch);
+
+    YMPrintCodeBytes(name, "before", target);
+
+    uint8_t current[8] = {0};
+    memcpy(current, target, patchSize);
+
+    if (memcmp(current, patch, patchSize) == 0) {
+        YMLog(@"%s already patched, address=0x%lx", name, (unsigned long)address);
+        return YES;
+    }
+
+    if (!YMProtectCodePage(address,
+                           patchSize,
+                           VM_PROT_READ | VM_PROT_WRITE | VM_PROT_COPY,
+                           name,
+                           "RW|COPY")) {
+        return NO;
+    }
+
+    memcpy(target, patch, patchSize);
+    sys_icache_invalidate(target, patchSize);
+
+    if (!YMProtectCodePage(address,
+                           patchSize,
+                           VM_PROT_READ | VM_PROT_EXECUTE,
+                           name,
+                           "RX")) {
+        return NO;
+    }
+
+    YMPrintCodeBytes(name, "after", target);
+
+    uint8_t check[8] = {0};
+    memcpy(check, target, patchSize);
+    BOOL ok = memcmp(check, patch, patchSize) == 0;
+
+    YMLog(@"%s patch result=%@, address=0x%lx",
+          name,
+          ok ? @"OK" : @"FAIL",
+          (unsigned long)address);
+
+    return ok;
+}
+
+/*
+ 在 address 处写一个 16 字节绝对跳转到 targetAddress。
+ 用于函数入口 / 指定指令点的 inline hook（阻止原逻辑或转交我们的 hook）。
+ */
+static BOOL YMPatchFunctionEntryAbsoluteJump(uintptr_t address,
+                                             uintptr_t targetAddress,
+                                             const char *name) {
     if (address == 0 || targetAddress == 0) {
         YMLog(@"%s inline hook failed: address or target is zero", name);
         return NO;
@@ -1138,20 +1346,14 @@ static BOOL YMPatchARM64AbsoluteJump(uintptr_t address,
     void *target = (void *)address;
 
     uint8_t patch[16] = {0};
-
-    uint32_t insnLdrX16 = 0x58000050; // ldr x16, #8
-    uint32_t insnBrX16  = 0xD61F0200; // br x16
-
-    memcpy(patch + 0, &insnLdrX16, sizeof(insnLdrX16));
-    memcpy(patch + 4, &insnBrX16, sizeof(insnBrX16));
-    memcpy(patch + 8, &targetAddress, sizeof(targetAddress));
+    size_t patchSize = YMEmitAbsoluteJump(targetAddress, patch);
 
     YMPrintCodeBytes(name, "before", target);
 
     uint8_t current[16] = {0};
-    memcpy(current, target, sizeof(current));
+    memcpy(current, target, patchSize);
 
-    if (memcmp(current, patch, sizeof(patch)) == 0) {
+    if (memcmp(current, patch, patchSize) == 0) {
         YMLog(@"%s already inline hooked, address=0x%lx",
               name,
               (unsigned long)address);
@@ -1159,19 +1361,19 @@ static BOOL YMPatchARM64AbsoluteJump(uintptr_t address,
     }
 
     if (!YMProtectCodePage(address,
-                           sizeof(patch),
+                           patchSize,
                            VM_PROT_READ | VM_PROT_WRITE | VM_PROT_COPY,
                            name,
                            "RW|COPY")) {
         return NO;
     }
 
-    memcpy(target, patch, sizeof(patch));
+    memcpy(target, patch, patchSize);
 
-    sys_icache_invalidate(target, sizeof(patch));
+    sys_icache_invalidate(target, patchSize);
 
     if (!YMProtectCodePage(address,
-                           sizeof(patch),
+                           patchSize,
                            VM_PROT_READ | VM_PROT_EXECUTE,
                            name,
                            "RX")) {
@@ -1179,9 +1381,9 @@ static BOOL YMPatchARM64AbsoluteJump(uintptr_t address,
     }
 
     uint8_t check[16] = {0};
-    memcpy(check, target, sizeof(check));
+    memcpy(check, target, patchSize);
 
-    BOOL ok = memcmp(check, patch, sizeof(patch)) == 0;
+    BOOL ok = memcmp(check, patch, patchSize) == 0;
 
     YMPrintCodeBytes(name, "after", target);
 
@@ -1908,14 +2110,8 @@ static void YMGroupExitFlushPendingNotices(const char *source) {
 }
 
 static void YMGroupExitBuildAbsoluteJump(uintptr_t targetAddress, uint8_t patch[16]) {
-    memset(patch, 0, 16);
-
-    uint32_t insnLdrX16 = 0x58000050; // ldr x16, #8
-    uint32_t insnBrX16  = 0xD61F0200; // br x16
-
-    memcpy(patch + 0, &insnLdrX16, sizeof(insnLdrX16));
-    memcpy(patch + 4, &insnBrX16, sizeof(insnBrX16));
-    memcpy(patch + 8, &targetAddress, sizeof(targetAddress));
+    // 复用统一的架构发射器，保证 arm64 / x86_64 跳板一致。
+    YMEmitAbsoluteJump(targetAddress, patch);
 }
 
 static BOOL YMGroupExitWriteCodeBytes(uintptr_t address,
@@ -2825,6 +3021,14 @@ __asm__(
 "    ldr  x16, [x16, _YMRevokeOriginCallsiteZeroBranchAddress@PAGEOFF]\n"
 "    br x16\n"
 );
+#elif defined(__x86_64__)
+/*
+ Phase 2 占位：x86_64 上的 inline callsite hook（保存/还原被覆盖指令 + 跳板）
+ 需要按 x86_64 反汇编重新设计，这套 arm64 寄存器保存/分支续跑逻辑不适用。
+ 目前 x86_64 profile 的 callsite VA 均为 0，YMPatchRevokeLocalCallsiteOnly 会提前
+ 返回，运行期永远不会跳到这里；这里只提供一个占位符号让链接通过。
+ */
+extern "C" void YMRevokeOriginCallsiteStub(void) {}
 #endif
 
 #pragma mark - 撤回 DeleteMessages Guard
@@ -2944,7 +3148,7 @@ static BOOL YMPatchRevokeLocalCallsiteOnly(uintptr_t slide, NSString *source) {
           (unsigned long)YMRevokeOriginCallsiteZeroBranchAddress,
           (unsigned long)(profile->revokeDeleteMessagesVA ? slide + profile->revokeDeleteMessagesVA : 0));
 
-    BOOL okCallsite = YMPatchARM64AbsoluteJump(callsite,
+    BOOL okCallsite = YMPatchFunctionEntryAbsoluteJump(callsite,
                                                (uintptr_t)&YMRevokeOriginCallsiteStub,
                                                "revoke origin local callsite after GetMessageBySvrId");
 
@@ -3037,6 +3241,15 @@ static BOOL YMPatchAntiRevokeWithSlide(intptr_t slide, NSString *source) {
          拿到内容后把 __dst flag 清掉，让后面别再撤 UI。
          */
         ok = YMPatchRevokeLocalCallsiteOnly((uintptr_t)slide, source ?: @"anti revoke install");
+    } else if (profile->hookMode == YMRevokeHookModeBlockEntry) {
+        /*
+         x86_64 MVP：
+         直接把撤回处理函数（hookPointerVA，专属、单调用者、用撤回模板）入口
+         patch 成 return 0，使其既不查找原消息也不替换 UI → 原消息保留=防撤回。
+         代价：不显示撤回人昵称/原文富提示。
+         */
+        ok = YMPatchFunctionReturnZero(pointerAddress,
+                                       "anti revoke block entry -> return 0");
     } else {
         YMLog(@"unknown revoke hook mode: %d", profile->hookMode);
         ok = NO;
@@ -3147,7 +3360,7 @@ static BOOL YMPatchMultiOpenWithWeChatDylibSlide(intptr_t slide, NSString *sourc
     BOOL finalOK = YES;
 
     if (tryPreventAddress != 0) {
-        BOOL okTryPrevent = YMPatchARM64ReturnYES(
+        BOOL okTryPrevent = YMPatchFunctionReturnYES(
             tryPreventAddress,
             "multi open: TryPreventMultiInstance -> return 1"
         );
@@ -3162,7 +3375,7 @@ static BOOL YMPatchMultiOpenWithWeChatDylibSlide(intptr_t slide, NSString *sourc
     }
 
     if (processCountAddress != 0) {
-        BOOL okProcessCount = YMPatchARM64ReturnYES(
+        BOOL okProcessCount = YMPatchFunctionReturnYES(
             processCountAddress,
             "multi open: GetMainWeixinProcessCount -> return 1"
         );
