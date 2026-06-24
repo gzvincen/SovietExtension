@@ -25,6 +25,7 @@
 #include <string>
 #include <time.h>
 #include <atomic>
+#include <execinfo.h>
 
 #pragma mark - 全局状态
 
@@ -53,6 +54,7 @@ typedef enum {
     YMRevokeHookModePointer = 0,   // 4.1.9：写 off_91EAD20
     YMRevokeHookModeInline  = 1,   // 4.1.10：patch 局部指令点
     YMRevokeHookModeBlockEntry = 2,// x86_64 MVP：直接 patch 撤回处理函数入口 return，阻断撤回（原消息保留）
+    YMRevokeHookModeBlockEntryNotice = 3,// x86_64：detour 撤回 handler 入口→插本地灰条提示后 return YES 阻断
 } YMRevokeHookMode;
 
 #pragma mark - MessageWrap 字段布局
@@ -315,17 +317,26 @@ static const YMWeChatAdaptProfile YMAdaptProfiles[] = {
         .shortVersion = "4.1.10",
         .buildVersion = "268853",
 
-        // Phase 2 防撤回：BlockEntry(sub_2B93F40 入口 return0) 已实测无效——
-        //   实际撤回显示路径不经过该函数区。真正的入站撤回处理函数尚未定位
-        //   （需反编译器；纯 CLI 在混淆+结构重排的 x86 切片上不可靠）。
-        //   暂置 0 → 防撤回在 x86 安全跳过，不影响多开/防更新。
-        .hookMode = YMRevokeHookModeInline,
-        .hookPointerVA = 0,
+        // ✅ Phase 2 防撤回：instrument-and-observe(运行时 backtrace)确认真实撤回链：
+        //   sync → 0x2bd6250(handler wrapper,单调用者,return bool) → 0x2bd62d0
+        //   → 0x2f93440(CoReplace,624模板@mov edx,0x270 + origin查找+UI替换)。
+        //   阻断点取最顶层撤回 wrapper 0x2bd6250，入口 patch 成 return YES(mov eax,1)：
+        //   上层认为已处理(不重试/不脱)，但 CoReplace/下游删除全不执行→原消息保留。
+        //   （旧候选 0x2b93f40 不在本(1v1)撤回链上，故此前 block 无效。）
+        .hookMode = YMRevokeHookModeBlockEntryNotice,
+        .hookPointerVA = 0x2bd6250,
 
-        .rawMessageTemplateVA = 0,
-        .messageWrapFromRawVA = 0,
-        .messageWrapDestructVA = 0,
-        .insertPaySysMsgToSessionVA = 0,
+        // ✅ 防撤回 notice（运行时+结构指纹确认，用于阻断后本地补一条灰条提示）：
+        //   rawMessageTemplate: 0x2bd6250 里 memcpy 源(616B sysmsg 模板)。
+        //   messageWrapFromRaw: 0x2bd6250 调的 sub(buf,rawRevokeMsg) 构造 wrap。
+        //   messageWrapDestruct: 0x2bd6250 末尾析构 wrap 的 sub。
+        //   insertPaySysMsgToSession: 引用 `<?xml..<sysmsg type="%s">..CDATA..` 模板
+        //     (0x84ef180)+写 msgType=0x2710、签名(arg0忽略,rsi=session,rdx=content)，
+        //     与 arm64 0x38EBBFC 同构；x86=0x3e79d80。
+        .rawMessageTemplateVA = 0x82AA8A8,
+        .messageWrapFromRawVA = 0x4ecc900,
+        .messageWrapDestructVA = 0x23b9d80,
+        .insertPaySysMsgToSessionVA = 0x3e79d80,
 
         // ✅ Phase 2 已逆向+结构指纹验证（NSRunningApplication 多实例检测）：
         //    TryPrevent: 栈canary + mainBundle->bundleIdentifier->
@@ -600,6 +611,12 @@ static BOOL YMProfileHasAntiRevokeAddresses(const YMWeChatAdaptProfile *profile)
 
     // BlockEntry：只 patch 撤回处理函数入口 return，不需要 base 函数 / 模板。
     if (profile->hookMode == YMRevokeHookModeBlockEntry) {
+        return profile->hookPointerVA != 0;
+    }
+
+    // BlockEntryNotice：detour 入口插提示后阻断。只要有入口即可安装；
+    // notice 4 件套缺失时 YMInsertLocalAntiRevokeNotice 会优雅失败，但仍阻断。
+    if (profile->hookMode == YMRevokeHookModeBlockEntryNotice) {
         return profile->hookPointerVA != 0;
     }
 
@@ -3182,6 +3199,33 @@ static int64_t YMHandleSysMsgRevokeMsgHook(int64_t a1, int64_t a2) {
     return 1;
 }
 
+#pragma mark - 防撤回 BlockEntry+Notice detour handler（x86_64 使用，两架构都编译以便链接）
+
+/*
+ 0x2bd6250 入口的 detour 目标。通过 16 字节绝对跳转(jmp)进入，未压新返回地址，
+ 故栈顶仍是原调用者返回地址；本函数 return 即返回上层 sync 层。
+   - 入口寄存器：rdi=arg0(管理器), rsi=arg1=rawRevokeMsg(messageWrapFromRaw 的源)。
+   - 先插一条本地灰条提示（复用 arch-independent 的 YMInsertLocalAntiRevokeNotice），
+     再返回 1（"已处理"），不调用原函数 → 撤回被阻断、原消息保留、显示提示。
+ thread-local 重入保护，避免极端情况下递归。
+*/
+static int64_t YMRevokeBlockNoticeHandler(int64_t a0, int64_t a1, int64_t a2,
+                                          int64_t a3, int64_t a4, int64_t a5) {
+    static __thread int inHandler = 0;
+    if (!inHandler) {
+        inHandler = 1;
+        @autoreleasepool {
+            try {
+                YMInsertLocalAntiRevokeNotice(a1);
+            } catch (...) {
+                YMLog(@"[BlockNotice] exception while inserting local notice");
+            }
+        }
+        inHandler = 0;
+    }
+    return 1; // 告诉 sync 层撤回已处理，且不调用原函数 → 阻断
+}
+
 #pragma mark - 安装 Patch
 
 static BOOL YMPatchAntiRevokeWithSlide(intptr_t slide, NSString *source) {
@@ -3243,13 +3287,26 @@ static BOOL YMPatchAntiRevokeWithSlide(intptr_t slide, NSString *source) {
         ok = YMPatchRevokeLocalCallsiteOnly((uintptr_t)slide, source ?: @"anti revoke install");
     } else if (profile->hookMode == YMRevokeHookModeBlockEntry) {
         /*
-         x86_64 MVP：
-         直接把撤回处理函数（hookPointerVA，专属、单调用者、用撤回模板）入口
-         patch 成 return 0，使其既不查找原消息也不替换 UI → 原消息保留=防撤回。
-         代价：不显示撤回人昵称/原文富提示。
+         x86_64（运行时 instrument-and-observe 确认的真实撤回链顶层 wrapper）：
+         hookPointerVA = 0x2bd6250 —— 入站撤回 handler 外层，仅 1 个调用者，正常
+         返回 bool=1（"已处理"）。把入口直接 patch 成 `mov eax,1; ret`(return YES)：
+         上层 sync 认为撤回已处理（不重试/不脱同步），但模板构建/CoReplace(0x2f93440)
+         /下游删除全部不执行 → 原消息保留 = 防撤回。
+         代价：不显示撤回人昵称/原文富提示。注意必须 returnYES 而非 return0，
+         否则上层可能视作未处理而走别的撤回路径或重试。
          */
-        ok = YMPatchFunctionReturnZero(pointerAddress,
-                                       "anti revoke block entry -> return 0");
+        ok = YMPatchFunctionReturnYES(pointerAddress,
+                                      "anti revoke block entry -> return YES");
+    } else if (profile->hookMode == YMRevokeHookModeBlockEntryNotice) {
+        /*
+         x86_64：在 0x2bd6250 入口 detour 到 YMRevokeBlockNoticeHandler。
+         handler 先用 arg1(=rawRevokeMsg) 调 YMInsertLocalAntiRevokeNotice 插一条
+         本地灰条提示（"已拦截撤回"），再 return 1（"已处理"）且不调用原函数 →
+         原消息保留 + 显示提示。notice 失败也不影响阻断。
+         */
+        ok = YMPatchFunctionEntryAbsoluteJump(pointerAddress,
+                                              (uintptr_t)&YMRevokeBlockNoticeHandler,
+                                              "anti revoke block+notice");
     } else {
         YMLog(@"unknown revoke hook mode: %d", profile->hookMode);
         ok = NO;
@@ -3560,6 +3617,152 @@ static void YMInstallAntiRevokeIfNeeded(void) {
 }
 
 
+#pragma mark - 撤回路径诊断（x86_64 instrument-and-observe）
+/*
+ 纯静态分析已证伪 "block 整个 0x2b93f40/0x2b94050 能阻止撤回"，真正的
+ "删除原消息 + 显示撤回" 路径未知。这里用运行时插桩：对一组撤回相关候选
+ 函数做透传 hook（还原-调用-重挂），每次进入时打印 调用者 + backtrace，
+ 让用户触发一次真实撤回后，从日志回溯出真正的处理链。x86_64 专用。
+*/
+#if defined(__x86_64__)
+
+typedef int64_t (*YMDiagOrigFunc)(int64_t,int64_t,int64_t,int64_t,int64_t,int64_t);
+
+typedef struct {
+    const char *name;
+    uintptr_t   staticVA;
+    uintptr_t   runtimeAddr;
+    uint8_t     origBytes[16];
+    uint8_t     hookBytes[16];
+    BOOL        saved;
+} YMDiagEntry;
+
+static YMDiagEntry gYMDiagTable[] = {
+    // 兜底锚点：撤回必然要按 svrid 找到原消息。它的 backtrace 直接暴露真正的 handler。
+    { "GetMsgBySvrId_2a176b0", 0x2a176b0, 0, {0}, {0}, NO },
+    // 未测过的 svrid-caller 函数（上一轮 7 个已证伪，全部换新）。
+    { "f_2a172f0", 0x2a172f0, 0, {0}, {0}, NO },
+    { "f_2a726d0", 0x2a726d0, 0, {0}, {0}, NO },
+    { "f_2abba80", 0x2abba80, 0, {0}, {0}, NO },
+    { "f_2abde80", 0x2abde80, 0, {0}, {0}, NO },
+    { "f_2af1510", 0x2af1510, 0, {0}, {0}, NO },
+    { "f_2b081d0", 0x2b081d0, 0, {0}, {0}, NO },
+    { "f_2b115b0", 0x2b115b0, 0, {0}, {0}, NO },
+    { "f_2b29cb0", 0x2b29cb0, 0, {0}, {0}, NO },
+    { "f_2b2e770", 0x2b2e770, 0, {0}, {0}, NO },
+    { "f_2b39580", 0x2b39580, 0, {0}, {0}, NO },
+    { "f_2bb5580", 0x2bb5580, 0, {0}, {0}, NO },
+    { "f_2bc9800", 0x2bc9800, 0, {0}, {0}, NO },
+    { "f_2bd7b10", 0x2bd7b10, 0, {0}, {0}, NO },
+    { "f_2be05b0", 0x2be05b0, 0, {0}, {0}, NO },
+    { "f_2beb800", 0x2beb800, 0, {0}, {0}, NO },
+    { "f_2ce32f0", 0x2ce32f0, 0, {0}, {0}, NO },
+    { "f_2d1f2b0", 0x2d1f2b0, 0, {0}, {0}, NO },
+};
+#define YM_DIAG_COUNT ((int)(sizeof(gYMDiagTable)/sizeof(gYMDiagTable[0])))
+
+// wechat dylib __text 静态 VA 范围，用于过滤 backtrace 里属于微信本体的帧。
+static const uintptr_t kYMTextLo = 0x15000;
+static const uintptr_t kYMTextHi = 0x6d9c780;
+
+static std::atomic_int gYMDiagSeq(0);
+static __thread int gYMDiagInHook = 0;
+
+static int64_t YMDiagCommon(int idx,
+                            int64_t a1,int64_t a2,int64_t a3,
+                            int64_t a4,int64_t a5,int64_t a6,
+                            void *caller) {
+    if (idx < 0 || idx >= YM_DIAG_COUNT) return 0;
+    YMDiagEntry *e = &gYMDiagTable[idx];
+    if (!e->runtimeAddr) return 0;
+
+    if (!gYMDiagInHook) {
+        gYMDiagInHook = 1;
+        @autoreleasepool {
+            int seq = gYMDiagSeq.fetch_add(1);
+            uintptr_t slide = YMWeChatDylibSlide;
+            uintptr_t callerVA = (uintptr_t)caller - slide;
+
+            void *bt[20];
+            int n = backtrace(bt, 20);
+            NSMutableString *chain = [NSMutableString string];
+            BOOL first = YES;
+            for (int i = 1; i < n; i++) {
+                uintptr_t rel = (uintptr_t)bt[i] - slide;
+                if (rel < kYMTextLo || rel > kYMTextHi) continue; // 只留微信本体帧
+                [chain appendFormat:@"%@0x%lx", (first ? @"" : @" <- "), (unsigned long)rel];
+                first = NO;
+            }
+            YMLog(@"[Diag#%d] %s a1=0x%llx a2=0x%llx a3=0x%llx a4=0x%llx caller=0x%lx | bt: %@",
+                  seq, e->name,
+                  (unsigned long long)a1,(unsigned long long)a2,
+                  (unsigned long long)a3,(unsigned long long)a4,
+                  (unsigned long)callerVA, chain);
+        }
+        gYMDiagInHook = 0;
+    }
+
+    // 透传：还原原始 16 字节 -> 调原函数 -> 重新挂钩。
+    YMGroupExitWriteCodeBytes(e->runtimeAddr, e->origBytes, 16, e->name, "diag restore");
+    YMDiagOrigFunc orig = (YMDiagOrigFunc)e->runtimeAddr;
+    int64_t result = 0;
+    try {
+        result = orig(a1,a2,a3,a4,a5,a6);
+    } catch (...) {
+        YMLog(@"[Diag] exception while calling original %s", e->name);
+    }
+    YMGroupExitWriteCodeBytes(e->runtimeAddr, e->hookBytes, 16, e->name, "diag rehook");
+    return result;
+}
+
+// 每个候选一个独立 thunk：知道自己的 index，并用 __builtin_return_address(0)
+// 取到真实调用者（因为入口是 jmp 跳板，未压新返回地址，栈顶仍是原调用者）。
+#define YM_DIAG_THUNK(I) \
+static int64_t YMDiagThunk_##I(int64_t a1,int64_t a2,int64_t a3,int64_t a4,int64_t a5,int64_t a6){ \
+    return YMDiagCommon(I,a1,a2,a3,a4,a5,a6,__builtin_return_address(0)); }
+YM_DIAG_THUNK(0)  YM_DIAG_THUNK(1)  YM_DIAG_THUNK(2)  YM_DIAG_THUNK(3)
+YM_DIAG_THUNK(4)  YM_DIAG_THUNK(5)  YM_DIAG_THUNK(6)  YM_DIAG_THUNK(7)
+YM_DIAG_THUNK(8)  YM_DIAG_THUNK(9)  YM_DIAG_THUNK(10) YM_DIAG_THUNK(11)
+YM_DIAG_THUNK(12) YM_DIAG_THUNK(13) YM_DIAG_THUNK(14) YM_DIAG_THUNK(15)
+YM_DIAG_THUNK(16) YM_DIAG_THUNK(17) YM_DIAG_THUNK(18) YM_DIAG_THUNK(19)
+YM_DIAG_THUNK(20) YM_DIAG_THUNK(21) YM_DIAG_THUNK(22) YM_DIAG_THUNK(23)
+
+static void *gYMDiagThunks[] = {
+    (void *)YMDiagThunk_0,  (void *)YMDiagThunk_1,  (void *)YMDiagThunk_2,  (void *)YMDiagThunk_3,
+    (void *)YMDiagThunk_4,  (void *)YMDiagThunk_5,  (void *)YMDiagThunk_6,  (void *)YMDiagThunk_7,
+    (void *)YMDiagThunk_8,  (void *)YMDiagThunk_9,  (void *)YMDiagThunk_10, (void *)YMDiagThunk_11,
+    (void *)YMDiagThunk_12, (void *)YMDiagThunk_13, (void *)YMDiagThunk_14, (void *)YMDiagThunk_15,
+    (void *)YMDiagThunk_16, (void *)YMDiagThunk_17, (void *)YMDiagThunk_18, (void *)YMDiagThunk_19,
+    (void *)YMDiagThunk_20, (void *)YMDiagThunk_21, (void *)YMDiagThunk_22, (void *)YMDiagThunk_23,
+};
+
+static void YMInstallRevokeDiag(void) {
+    static BOOL installed = NO;
+    if (installed) return;
+    if (YMWeChatDylibSlide == 0) {
+        YMLog(@"[Diag] slide=0, defer");
+        return;
+    }
+    for (int i = 0; i < YM_DIAG_COUNT; i++) {
+        YMDiagEntry *e = &gYMDiagTable[i];
+        e->runtimeAddr = YMWeChatDylibSlide + e->staticVA;
+        memcpy(e->origBytes, (void *)e->runtimeAddr, 16);
+        YMEmitAbsoluteJump((uintptr_t)gYMDiagThunks[i], e->hookBytes);
+        if (YMGroupExitWriteCodeBytes(e->runtimeAddr, e->hookBytes, 16, e->name, "diag install")) {
+            e->saved = YES;
+            YMLog(@"[Diag] hooked %s at 0x%lx", e->name, (unsigned long)e->runtimeAddr);
+        } else {
+            YMLog(@"[Diag] hook FAILED %s at 0x%lx", e->name, (unsigned long)e->runtimeAddr);
+        }
+    }
+    installed = YES;
+    YMLog(@"[Diag] install done, slide=0x%lx, %d hooks", (unsigned long)YMWeChatDylibSlide, YM_DIAG_COUNT);
+}
+
+#else
+static void YMInstallRevokeDiag(void) {}
+#endif
+
 #pragma mark - constructor
 
 __attribute__((constructor))
@@ -3614,15 +3817,20 @@ static void YMWeChatAntiRevokePatchEntry(void) {
              如果 wechat.dylib 在之前已经加载，可以直接安装 hook。
             */
             YMInstallAntiRevokePatch();
+            // 诊断模块已完成定位，正式补丁阶段关闭，避免热函数 hook 的噪声/开销。
+            // 需再次插桩时取消注释 YMInstallRevokeDiag()。
+            // YMInstallRevokeDiag();
 
             dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(1 * NSEC_PER_SEC)),
                            dispatch_get_main_queue(), ^{
                 YMInstallAntiRevokePatch();
+                // YMInstallRevokeDiag();
             });
 
             dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(3 * NSEC_PER_SEC)),
                            dispatch_get_main_queue(), ^{
                 YMInstallAntiRevokePatch();
+                // YMInstallRevokeDiag();
             });
         }
 
