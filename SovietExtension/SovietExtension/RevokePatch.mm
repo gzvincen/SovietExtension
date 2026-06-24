@@ -23,6 +23,7 @@
 #import "NSObject+MainHook.h"
 
 #include <string>
+#include <vector>
 #include <time.h>
 #include <atomic>
 #include <execinfo.h>
@@ -42,6 +43,14 @@ static BOOL YMHasRegisteredDyldCallback = NO;
 // 群员退群监控 Patch 状态
 static BOOL YMHasPatchedGroupExitMonitor = NO;
 
+static BOOL YMHasPatchedOpenURLWithSystemBrowser = NO;
+
+// 开关统一在构造函数里
+static BOOL YMFeatureAntiUpdateEnabled = NO;
+static BOOL YMFeatureAntiRevokeEnabled = NO;
+static BOOL YMFeatureGroupExitMonitorEnabled = NO;
+static BOOL YMFeatureOpenURLWithSystemBrowserEnabled = NO;
+
 //static const uintptr_t YMMultiOpenTryPreventMultiInstanceVA = 0x1C0A64;
 
 // 先声明，后面 constructor、multi open、anti revoke、群员退群监控都会用。
@@ -49,6 +58,7 @@ static void YMDyldImageAdded(const struct mach_header *mh, intptr_t vmaddr_slide
 static void YMRegisterDyldCallbackIfNeeded(void);
 static void YMInstallMultiOpenPatch(void);
 static void YMInstallGroupExitMonitorPatch(void);
+static void YMInstallOpenURLWithSystemBrowserPatch(void);
 
 typedef enum {
     YMRevokeHookModePointer = 0,   // 4.1.9：写 off_91EAD20
@@ -115,10 +125,15 @@ typedef struct {
     uintptr_t groupExitFMessagePreVA;
     uintptr_t groupExitUpdateSessionCacheVA;
 
+    uintptr_t groupExitMemberDataListVA;
+    uintptr_t groupExitChatroomInfoOperatorVA;
+
     uintptr_t revokeOriginCallsiteAfterQueryVA;
     uintptr_t revokeOriginCallsiteContinueVA;
     uintptr_t revokeOriginCallsiteZeroBranchVA;
     uintptr_t revokeDeleteMessagesVA;
+
+    uintptr_t openURLWebViewKindVA;
 
     YMMessageWrapLayout layout;
     
@@ -163,18 +178,21 @@ static const YMWeChatAdaptProfile YMAdaptProfiles[] = {
         // sub_3822FA4：内部会构造 type=10000 + paymsg XML，然后调用 ym_AddLocalMessageWrap。
         .insertPaySysMsgToSessionVA = 0x3822FA4, // [CDATA]->
         .YMMultiOpenTryPreventMultiInstanceVA = 0x1C0A64,
-        // 4.1.9 暂时没有适配这个进程数量检测点，填 0 表示跳过。
         .YMGetMainWeixinProcessCountVA = 0x449E2BC,
 
-        // 群员退群监控 4.1.9 暂未适配，填 0 自动跳过。
+        //4.1.9懒得搞了,以最新为准
         .groupExitDBApplyVA = 0,
         .groupExitFMessagePreVA = 0,
         .groupExitUpdateSessionCacheVA = 0,
+        .groupExitMemberDataListVA = 0,
+        .groupExitChatroomInfoOperatorVA = 0,
 
         .revokeOriginCallsiteAfterQueryVA = 0,
         .revokeOriginCallsiteContinueVA = 0,
         .revokeOriginCallsiteZeroBranchVA = 0,
         .revokeDeleteMessagesVA = 0,
+
+        .openURLWebViewKindVA = 0,
 
         .layout = {
             .messageWrapSize = 616,
@@ -227,6 +245,13 @@ static const YMWeChatAdaptProfile YMAdaptProfiles[] = {
         //yq
         .groupExitUpdateSessionCacheVA = 0x37EACC0,
 
+        //Lhook->GetAllMemberDataList
+        .groupExitMemberDataListVA = 0x2109D40,
+
+        //提前拿chatroom_manager,Lhook->chatroom_manager.cc func=operator()
+        //启动后最早出现它的地方
+        .groupExitChatroomInfoOperatorVA = 0x21249D4,
+
         //callsite拿
         /*
          sub_2819F44(__dst, v139[0], v137 + 392, *((_QWORD *)v137 + 45));//不要去直接去碰sub_2819F44这个函数,要去碰他的地址:
@@ -242,6 +267,8 @@ static const YMWeChatAdaptProfile YMAdaptProfiles[] = {
         .revokeOriginCallsiteZeroBranchVA = 0x2B71274,//->Lhook->CoReplaceOriginMessageByRevoke里
         
         .revokeDeleteMessagesVA = 0x2814B9C,//->Lhook->DeleteMessages
+
+        .openURLWebViewKindVA = 0x1C7C6AC, //->Lhook->GetUrlWebViewKind
 
         .layout = {
             .messageWrapSize = 616,
@@ -277,11 +304,14 @@ static const YMWeChatAdaptProfile YMAdaptProfiles[] = {
          .groupExitDBApplyVA = 新版 chatroom_member DB apply 函数入口地址，没有就填 0,
          .groupExitFMessagePreVA = 新版 InsertFMessageToSessionPre 函数入口地址，没有就填 0,
          .groupExitUpdateSessionCacheVA = 新版 UpdateSessionCache 函数入口地址，没有就填 0,
+         .groupExitMemberDataListVA = 新版 GetAllMemberDataList 函数入口地址，没有就填 0,
+         .groupExitChatroomInfoOperatorVA = 新版 chatroom_manager::operator() / GetChatroomInfo 回调入口地址，没有就填 0,
 
          .revokeOriginCallsiteAfterQueryVA = 新版 BL sub_2819F44 后一条指令地址，没有就填 0,
          .revokeOriginCallsiteContinueVA = 新版继续执行地址，没有就填 0,
          .revokeOriginCallsiteZeroBranchVA = 新版 CBZ 分支地址，没有就填 0,
          .revokeDeleteMessagesVA = 新版 DeleteMessages 函数入口地址，没有就填 0,
+         .openURLWebViewKindVA = 新版 GetUrlWebViewKind 函数入口地址，没有就填 0,
 
          .layout = {
              .messageWrapSize = 616,
@@ -408,6 +438,39 @@ typedef int64_t (*YMAddLocalMessageWrapFunc)(int64_t messageService, void *messa
 typedef int64_t (*YMGroupExitDBApplyFunc)(int64_t task);
 typedef void (*YMGroupExitFMessagePreFunc)(int64_t a1, int64_t *a2);
 typedef void (*YMGroupExitUpdateSessionCacheFunc)(uint64_t a1, int64_t a2, int64_t a3, int a4);
+// chatroom_manager.cc::GetAllMemberDataList
+// a2 = roomID std::string*
+// a3 = output vector，返回后每条成员数据 104 字节。
+typedef int64_t (*YMGroupExitMemberDataListFunc)(int64_t a1, int64_t *roomID, int64_t *outVector);
+
+// chatroom_manager.cc::operator() / GetChatroomInfo 早期回调。
+// sub_21249D4(a1)：a1 + 8 = chatroom_manager，a1 + 16 = roomID std::string。
+typedef void (*YMGroupExitChatroomInfoOperatorFunc)(int64_t a1);
+
+//GetAllMemberDataList 返回的成员 UI 数据结构。
+struct YMGroupExitChatroomMemberUIData {
+    std::string memberID;
+    std::string displayName;
+    std::string extraName;
+    int32_t type;
+    uint8_t noContact;
+    uint8_t flag1;
+    uint8_t flag2;
+    uint8_t padding[25];
+};
+static_assert(sizeof(std::string) == 24, "Unexpected libc++ std::string layout");
+static_assert(sizeof(YMGroupExitChatroomMemberUIData) == 104, "Unexpected chatroom member UI data size");
+
+// 简单作用域保护，保证 YMGroupExitPreloadingMemberDataList 遇到 return 也能复位。
+struct YMGroupExitAtomicBoolResetGuard {
+    std::atomic_bool *flag;
+    explicit YMGroupExitAtomicBoolResetGuard(std::atomic_bool *target) : flag(target) {}
+    ~YMGroupExitAtomicBoolResetGuard() {
+        if (flag) {
+            flag->store(false);
+        }
+    }
+};
 
 static uintptr_t YMGroupExitDBApplyRuntimeAddress = 0;
 static uint8_t YMGroupExitOriginalDBApplyBytes[16] = {0};
@@ -424,17 +487,37 @@ static uint8_t YMGroupExitOriginalUpdateSessionCacheBytes[16] = {0};
 static uint8_t YMGroupExitHookUpdateSessionCacheBytes[16] = {0};
 static BOOL YMGroupExitHasSavedOriginalUpdateSessionCacheBytes = NO;
 
+static uintptr_t YMGroupExitMemberDataListRuntimeAddress = 0;
+static uint8_t YMGroupExitOriginalMemberDataListBytes[16] = {0};
+static uint8_t YMGroupExitHookMemberDataListBytes[16] = {0};
+static BOOL YMGroupExitHasSavedOriginalMemberDataListBytes = NO;
+
+static uintptr_t YMGroupExitChatroomInfoOperatorRuntimeAddress = 0;
+static uint8_t YMGroupExitOriginalChatroomInfoOperatorBytes[16] = {0};
+static uint8_t YMGroupExitHookChatroomInfoOperatorBytes[16] = {0};
+static BOOL YMGroupExitHasSavedOriginalChatroomInfoOperatorBytes = NO;
+
 static std::atomic_bool YMGroupExitCallingOriginalDBApply(false);
 static std::atomic_bool YMGroupExitCallingOriginalFMessagePre(false);
 static std::atomic_bool YMGroupExitCallingOriginalUpdateSessionCache(false);
+static std::atomic_bool YMGroupExitCallingOriginalMemberDataList(false);
+static std::atomic_bool YMGroupExitCallingOriginalChatroomInfoOperator(false);
 static std::atomic_bool YMGroupExitFlushingPending(false);
+static std::atomic_bool YMGroupExitPreloadingMemberDataList(false);
 
-// 统一读取退群监控开关。
-// 注意：安装 hook 前要判断；hook 已经安装后也要在 hook 内判断。
-// 因为 ARM64 inline hook 一旦写入当前进程，单纯把 NSUserDefaults 改成 false，
-// 已经安装的 hook 不会自动消失。
+// 最近一次捕获到的 chatroom_manager 实例。
+static std::atomic<int64_t> YMGroupExitKnownChatroomManager(0);
+
 static BOOL YMIsGroupExitMonitorEnabled(void) {
-    return [[NSUserDefaults standardUserDefaults] boolForKey:kExitChatroom];
+    return YMFeatureGroupExitMonitorEnabled;
+}
+
+static BOOL YMIsAntiRevokeEnabled(void) {
+    return YMFeatureAntiRevokeEnabled;
+}
+
+static BOOL YMIsOpenURLWithSystemBrowserEnabled(void) {
+    return YMFeatureOpenURLWithSystemBrowserEnabled;
 }
 
 #pragma mark - 日志
@@ -1303,8 +1386,86 @@ static BOOL YMPatchFunctionReturnYES(uintptr_t address, const char *name) {
 }
 
 /*
- 把目标函数 patch 成直接返回 0（BlockEntry 防撤回）。
- 与 YMPatchFunctionReturnYES 结构一致，只是写 return-0 桩。
+ ARM64 int 强制返回：
+
+   mov w0, #value
+   ret
+ */
+static BOOL YMPatchARM64ReturnInt32(uintptr_t address, uint32_t value, const char *name) {
+    if (address == 0) {
+        YMLog(@"%s patch failed: address is zero", name);
+        return NO;
+    }
+
+    if (value > 0xFFFF) {
+        YMLog(@"%s patch failed: value too large: %u", name, value);
+        return NO;
+    }
+
+    void *target = (void *)address;
+
+    uint32_t patch[2] = {
+        0x52800000 | ((value & 0xFFFF) << 5), // mov w0, #value
+        0xD65F03C0                            // ret
+    };
+
+    YMPrintCodeBytes(name, "before", target);
+
+    uint32_t current[2] = {0};
+    memcpy(current, target, sizeof(current));
+
+    if (current[0] == patch[0] && current[1] == patch[1]) {
+        YMLog(@"%s already patched, address=0x%lx", name, (unsigned long)address);
+        return YES;
+    }
+
+    if (!YMProtectCodePage(address,
+                           sizeof(patch),
+                           VM_PROT_READ | VM_PROT_WRITE | VM_PROT_COPY,
+                           name,
+                           "RW|COPY")) {
+        return NO;
+    }
+
+    memcpy(target, patch, sizeof(patch));
+    sys_icache_invalidate(target, sizeof(patch));
+
+    if (!YMProtectCodePage(address,
+                           sizeof(patch),
+                           VM_PROT_READ | VM_PROT_EXECUTE,
+                           name,
+                           "RX")) {
+        return NO;
+    }
+
+    uint32_t check[2] = {0};
+    memcpy(check, target, sizeof(check));
+
+    BOOL ok = check[0] == patch[0] && check[1] == patch[1];
+
+    YMPrintCodeBytes(name, "after", target);
+
+    YMLog(@"%s patch result=%@, address=0x%lx, value=%u",
+          name,
+          ok ? @"OK" : @"FAIL",
+          (unsigned long)address,
+          value);
+
+    return ok;
+}
+
+/*
+ 4.1.10
+ ARM64 函数入口绝对跳转：
+
+   ldr x16, #8
+   br  x16
+   .quad hookAddress
+
+ 机器码：
+   50 00 00 58
+   00 02 1F D6
+   hookAddress 8 bytes
  */
 static BOOL YMPatchFunctionReturnZero(uintptr_t address, const char *name) {
     if (address == 0) {
@@ -1638,6 +1799,29 @@ static NSMutableArray<NSDictionary<NSString *, id> *> *YMGroupExitPendingNotices
     return queue;
 }
 
+// 群成员展示名缓存。
+//key主要为id和昵称
+static NSMutableDictionary<NSString *, NSString *> *YMGroupExitDisplayNameCache(void) {
+    static NSMutableDictionary<NSString *, NSString *> *cache = nil;
+    static dispatch_once_t onceToken;
+    dispatch_once(&onceToken, ^{
+        cache = [[NSMutableDictionary alloc] init];
+    });
+    return cache;
+}
+
+// 需要主动预热昵称的群队列。
+// DB first snapshot 能提前看到完整成员列表，此时先记录 roomID；
+//GetAllMemberDataList
+static NSMutableDictionary<NSString *, NSDate *> *YMGroupExitPreloadRoomQueue(void) {
+    static NSMutableDictionary<NSString *, NSDate *> *queue = nil;
+    static dispatch_once_t onceToken;
+    dispatch_once(&onceToken, ^{
+        queue = [[NSMutableDictionary alloc] init];
+    });
+    return queue;
+}
+
 static void YMGroupExitClearRuntimeStateIfDisabled(const char *source) {
     if (YMIsGroupExitMonitorEnabled()) {
         return;
@@ -1664,6 +1848,20 @@ static void YMGroupExitClearRuntimeStateIfDisabled(const char *source) {
     @synchronized (recentTipCache) {
         if (recentTipCache.count > 0) {
             [recentTipCache removeAllObjects];
+        }
+    }
+
+    NSMutableDictionary<NSString *, NSString *> *displayNameCache = YMGroupExitDisplayNameCache();
+    @synchronized (displayNameCache) {
+        if (displayNameCache.count > 0) {
+            [displayNameCache removeAllObjects];
+        }
+    }
+
+    NSMutableDictionary<NSString *, NSDate *> *preloadQueue = YMGroupExitPreloadRoomQueue();
+    @synchronized (preloadQueue) {
+        if (preloadQueue.count > 0) {
+            [preloadQueue removeAllObjects];
         }
     }
 }
@@ -1710,8 +1908,118 @@ static BOOL YMGroupExitMemberIDLooksUseful(NSString *value, NSString *roomID) {
     return NO;
 }
 
+static NSString *YMGroupExitTrimDisplayName(NSString *value) {
+    if (value.length == 0) {
+        return @"";
+    }
+
+    NSString *name = [value stringByTrimmingCharactersInSet:[NSCharacterSet whitespaceAndNewlineCharacterSet]] ?: @"";
+
+    while ([name hasPrefix:@"@"] && name.length > 1) {
+        name = [name substringFromIndex:1];
+    }
+
+    return [name stringByTrimmingCharactersInSet:[NSCharacterSet whitespaceAndNewlineCharacterSet]] ?: @"";
+}
+
+static BOOL YMGroupExitDisplayNameLooksUseful(NSString *displayName, NSString *memberID) {
+    NSString *name = YMGroupExitTrimDisplayName(displayName);
+    if (name.length == 0 || name.length > 128) {
+        return NO;
+    }
+
+    if (memberID.length > 0 && [name isEqualToString:memberID]) {
+        return NO;
+    }
+
+    if ([name containsString:@"@chatroom"] || [name containsString:@"<"] || [name containsString:@">"]) {
+        return NO;
+    }
+
+    NSString *lower = name.lowercaseString;
+    if ([lower hasPrefix:@"http://"] ||
+        [lower hasPrefix:@"https://"] ||
+        [lower containsString:@"contact_storage"] ||
+        [lower containsString:@"chatroom_member"] ||
+        [lower containsString:@"getchatroommembershowname"]) {
+        return NO;
+    }
+
+    return YES;
+}
+
+static void YMGroupExitCacheDisplayName(NSString *roomID,
+                                        NSString *memberID,
+                                        NSString *displayName,
+                                        const char *source) {
+    if (!YMGroupExitIsChatRoomID(roomID) || memberID.length == 0) {
+        return;
+    }
+
+    NSString *name = YMGroupExitTrimDisplayName(displayName);
+    if (!YMGroupExitDisplayNameLooksUseful(name, memberID)) {
+        return;
+    }
+
+    NSMutableDictionary<NSString *, NSString *> *cache = YMGroupExitDisplayNameCache();
+    NSString *roomKey = [NSString stringWithFormat:@"%@|%@", roomID, memberID];
+
+    @synchronized (cache) {
+        NSString *oldName = cache[roomKey];
+        cache[roomKey] = name;
+        cache[memberID] = name;
+
+        if (cache.count > 4096) {
+            NSArray<NSString *> *allKeys = [cache allKeys];
+            NSUInteger removeCount = MIN((NSUInteger)512, allKeys.count);
+            for (NSUInteger i = 0; i < removeCount; i++) {
+                [cache removeObjectForKey:allKeys[i]];
+            }
+        }
+
+        if (![oldName isEqualToString:name]) {
+            YMLog(@"[GroupExitMonitor] display name cached. source=%s room=%@ member=%@ name=%@",
+                  source ?: "",
+                  roomID ?: @"",
+                  memberID ?: @"",
+                  name ?: @"");
+        }
+    }
+}
+
+static NSString *YMGroupExitCachedDisplayName(NSString *roomID, NSString *memberID) {
+    if (memberID.length == 0) {
+        return @"";
+    }
+
+    NSMutableDictionary<NSString *, NSString *> *cache = YMGroupExitDisplayNameCache();
+    @synchronized (cache) {
+        if (roomID.length > 0) {
+            NSString *roomKey = [NSString stringWithFormat:@"%@|%@", roomID, memberID];
+            NSString *roomName = cache[roomKey];
+            if (YMGroupExitDisplayNameLooksUseful(roomName, memberID)) {
+                return roomName;
+            }
+        }
+
+        NSString *globalName = cache[memberID];
+        if (YMGroupExitDisplayNameLooksUseful(globalName, memberID)) {
+            return globalName;
+        }
+    }
+
+    return @"";
+}
+
 static NSString *YMGroupExitDisplayNameForMemberID(NSString *memberID, NSString *roomID) {
-    // 当前这版先保守使用 memberID。后续如果逆出 contact / chatroom nickname 查询函数，再在这里替换成群昵称。
+    NSString *displayName = YMGroupExitCachedDisplayName(roomID, memberID);
+    if (displayName.length > 0) {
+        if (memberID.length > 0) {
+            return [NSString stringWithFormat:@"%@（%@）", displayName, memberID];
+        }
+        return displayName;
+    }
+
     if (memberID.length > 0) {
         return memberID;
     }
@@ -1945,6 +2253,171 @@ static NSDictionary<NSString *, NSSet<NSString *> *> *YMGroupExitReadSnapshotsFr
     return [result copy];
 }
 
+
+// 把 roomID 放进昵称预热队列。
+// 只入队，不在 DB apply 栈里主动调用微信函数，避免 DB / manager 锁重入。
+static void YMGroupExitRequestPreloadRoom(NSString *roomID, NSString *reason) {
+    if (!YMIsGroupExitMonitorEnabled() || !YMGroupExitIsChatRoomID(roomID)) {
+        return;
+    }
+
+    NSMutableDictionary<NSString *, NSDate *> *queue = YMGroupExitPreloadRoomQueue();
+    NSDate *now = [NSDate date];
+
+    @synchronized (queue) {
+        NSDate *last = queue[roomID];
+        // 同一个群短时间内只保留一次预热请求，避免 DB apply 高频刷新时反复调用。
+        if (last && [now timeIntervalSinceDate:last] < 30.0) {
+            return;
+        }
+
+        queue[roomID] = now;
+
+        if (queue.count > 256) {
+            NSArray<NSString *> *allKeys = [queue allKeys];
+            NSUInteger removeCount = MIN((NSUInteger)64, allKeys.count);
+            for (NSUInteger i = 0; i < removeCount; i++) {
+                [queue removeObjectForKey:allKeys[i]];
+            }
+        }
+    }
+
+    YMLog(@"[GroupExitMonitor] preload room queued. room=%@ reason=%@",
+          roomID ?: @"",
+          reason ?: @"");
+}
+
+static NSArray<NSString *> *YMGroupExitDrainPreloadRooms(NSUInteger maxCount) {
+    NSMutableDictionary<NSString *, NSDate *> *queue = YMGroupExitPreloadRoomQueue();
+    NSMutableArray<NSString *> *rooms = [NSMutableArray array];
+
+    @synchronized (queue) {
+        if (queue.count == 0) {
+            return @[];
+        }
+
+        NSArray<NSString *> *allRooms = [queue allKeys];
+        NSUInteger count = MIN(maxCount, allRooms.count);
+        for (NSUInteger i = 0; i < count; i++) {
+            NSString *roomID = allRooms[i];
+            if (roomID.length > 0) {
+                [rooms addObject:roomID];
+                [queue removeObjectForKey:roomID];
+            }
+        }
+    }
+
+    return [rooms copy];
+}
+
+static void YMGroupExitCacheMemberDataListFromOutVector(NSString *roomID,
+                                                        int64_t *outVector,
+                                                        const char *source) {
+    if (!YMIsGroupExitMonitorEnabled()) {
+        return;
+    }
+
+    if (!YMGroupExitIsChatRoomID(roomID) || !outVector) {
+        return;
+    }
+
+    uintptr_t begin = 0;
+    uintptr_t end = 0;
+    uintptr_t cap = 0;
+    uintptr_t vectorAddress = (uintptr_t)outVector;
+
+    if (!YMSafeReadPointer(vectorAddress + 0, &begin) ||
+        !YMSafeReadPointer(vectorAddress + 8, &end) ||
+        !YMSafeReadPointer(vectorAddress + 16, &cap)) {
+        YMLog(@"[GroupExitMonitor] member data list read vector failed. room=%@ source=%s vector=0x%lx",
+              roomID ?: @"",
+              source ?: "",
+              (unsigned long)vectorAddress);
+        return;
+    }
+
+    if (begin == 0 || end == 0 || end < begin || cap < end || begin < 0x100000000ULL) {
+        YMLog(@"[GroupExitMonitor] member data list invalid vector bounds. room=%@ source=%s begin=0x%lx end=0x%lx cap=0x%lx",
+              roomID ?: @"",
+              source ?: "",
+              (unsigned long)begin,
+              (unsigned long)end,
+              (unsigned long)cap);
+        return;
+    }
+
+    const size_t entrySize = 104;
+    uintptr_t byteSize = end - begin;
+    if (byteSize == 0 || (byteSize % entrySize) != 0) {
+        YMLog(@"[GroupExitMonitor] member data list size mismatch. room=%@ source=%s byteSize=%lu begin=0x%lx end=0x%lx",
+              roomID ?: @"",
+              source ?: "",
+              (unsigned long)byteSize,
+              (unsigned long)begin,
+              (unsigned long)end);
+        return;
+    }
+
+    size_t count = (size_t)(byteSize / entrySize);
+    if (count == 0 || count > 20000) {
+        YMLog(@"[GroupExitMonitor] member data list unreasonable count=%zu. room=%@ source=%s",
+              count,
+              roomID ?: @"",
+              source ?: "");
+        return;
+    }
+
+    NSUInteger cachedCount = 0;
+    NSMutableArray<NSString *> *samples = [NSMutableArray array];
+
+    for (size_t i = 0; i < count; i++) {
+        uintptr_t entry = begin + i * entrySize;
+
+        // sub_2066288 已确认 104 字节成员 UI 数据结构：
+        // entry + 0  = memberID / wxid
+        // entry + 24 = displayName / 群成员展示名
+        // entry + 48 = extraName / 搜索辅助字段
+        NSString *memberID = YMNSStringFromLibcppStringObject((const void *)(entry + 0));
+        NSString *displayName = YMNSStringFromLibcppStringObject((const void *)(entry + 24));
+        NSString *extraName = YMNSStringFromLibcppStringObject((const void *)(entry + 48));
+
+        if (!YMGroupExitMemberIDLooksUseful(memberID, roomID)) {
+            continue;
+        }
+
+        NSString *nameToCache = displayName;
+        if (!YMGroupExitDisplayNameLooksUseful(nameToCache, memberID) &&
+            YMGroupExitDisplayNameLooksUseful(extraName, memberID)) {
+            nameToCache = extraName;
+        }
+
+        if (!YMGroupExitDisplayNameLooksUseful(nameToCache, memberID)) {
+            continue;
+        }
+
+        YMGroupExitCacheDisplayName(roomID, memberID, nameToCache, source ?: "GetAllMemberDataList");
+        cachedCount++;
+
+        if (samples.count < 6) {
+            [samples addObject:[NSString stringWithFormat:@"%@=%@", memberID ?: @"", YMGroupExitTrimDisplayName(nameToCache) ?: @""]];
+        }
+    }
+
+    if (cachedCount > 0) {
+        YMLog(@"[GroupExitMonitor] member display names cached. source=%s room=%@ total=%zu cached=%lu samples=%@",
+              source ?: "",
+              roomID ?: @"",
+              count,
+              (unsigned long)cachedCount,
+              [samples componentsJoinedByString:@", "] ?: @"");
+    } else {
+        YMLog(@"[GroupExitMonitor] member data list parsed but no display name cached. source=%s room=%@ total=%zu",
+              source ?: "",
+              roomID ?: @"",
+              count);
+    }
+}
+
 static void YMGroupExitHandleDBApplySnapshot(NSString *roomID, NSSet<NSString *> *newSnapshot) {
     if (!YMGroupExitIsChatRoomID(roomID) || newSnapshot.count == 0) {
         return;
@@ -1964,6 +2437,7 @@ static void YMGroupExitHandleDBApplySnapshot(NSString *roomID, NSSet<NSString *>
             YMLog(@"[GroupExitMonitor] DB first snapshot stored. room=%@ members=%lu",
                   roomID,
                   (unsigned long)newSnapshot.count);
+            YMGroupExitRequestPreloadRoom(roomID, @"DB first snapshot");
             return;
         }
 
@@ -2007,6 +2481,10 @@ static void YMGroupExitHandleDBApplySnapshot(NSString *roomID, NSSet<NSString *>
         YMGroupExitClearRecentTip(roomID, memberID, @"member appeared in DB snapshot");
     }
 
+    // 群成员快照发生变化时，顺手重新预热该群昵称。
+    // 如果已经捕获到 chatroom_manager 实例，后续安全点会主动刷新成员展示名缓存。
+    YMGroupExitRequestPreloadRoom(roomID, leftMembers.count > 0 ? @"DB member left snapshot" : @"DB snapshot updated");
+
     if (leftMembers.count == 0) {
         YMLog(@"[GroupExitMonitor] DB snapshot updated, no member left. room=%@ old=%lu new=%lu",
               roomID,
@@ -2018,7 +2496,7 @@ static void YMGroupExitHandleDBApplySnapshot(NSString *roomID, NSSet<NSString *>
     for (NSString *memberID in leftMembers) {
         NSString *displayName = YMGroupExitDisplayNameForMemberID(memberID, roomID);
         NSString *exitTimeText = YMFormatTimestamp(0, 0);
-        NSString *noticeText = [NSString stringWithFormat:@"⚠️苏维埃退群监控⚠️\n%@ 已退群\n%@",
+        NSString *noticeText = [NSString stringWithFormat:@"⚠️苏维埃退群监控⚠️\n@%@ 已退群\n%@",
                                 displayName ?: memberID,
                                 exitTimeText ?: @""];
 
@@ -2339,6 +2817,371 @@ static void YMGroupExitCallOriginalUpdateSessionCache(uint64_t a1, int64_t a2, i
     YMGroupExitCallingOriginalUpdateSessionCache.store(false);
 }
 
+
+static BOOL YMGroupExitRestoreOriginalChatroomInfoOperator(void) {
+    if (!YMGroupExitChatroomInfoOperatorRuntimeAddress || !YMGroupExitHasSavedOriginalChatroomInfoOperatorBytes) {
+        return NO;
+    }
+
+    return YMGroupExitWriteCodeBytes(YMGroupExitChatroomInfoOperatorRuntimeAddress,
+                                     YMGroupExitOriginalChatroomInfoOperatorBytes,
+                                     sizeof(YMGroupExitOriginalChatroomInfoOperatorBytes),
+                                     "group exit chatroom_manager::operator GetChatroomInfo",
+                                     "restore original");
+}
+
+static BOOL YMGroupExitReapplyChatroomInfoOperatorHook(void) {
+    if (!YMGroupExitChatroomInfoOperatorRuntimeAddress) {
+        return NO;
+    }
+
+    return YMGroupExitWriteCodeBytes(YMGroupExitChatroomInfoOperatorRuntimeAddress,
+                                     YMGroupExitHookChatroomInfoOperatorBytes,
+                                     sizeof(YMGroupExitHookChatroomInfoOperatorBytes),
+                                     "group exit chatroom_manager::operator GetChatroomInfo",
+                                     "reapply hook");
+}
+
+static void YMGroupExitCallOriginalChatroomInfoOperator(int64_t a1) {
+    if (!YMGroupExitChatroomInfoOperatorRuntimeAddress) {
+        return;
+    }
+
+    if (YMGroupExitCallingOriginalChatroomInfoOperator.exchange(true)) {
+        YMLog(@"[GroupExitMonitor] recursive original chatroom_manager operator call suppressed");
+        return;
+    }
+
+    BOOL restored = YMGroupExitRestoreOriginalChatroomInfoOperator();
+    if (!restored) {
+        YMLog(@"[GroupExitMonitor] restore original chatroom_manager operator failed, skip calling original to avoid recursion");
+        YMGroupExitCallingOriginalChatroomInfoOperator.store(false);
+        return;
+    }
+
+    YMGroupExitChatroomInfoOperatorFunc Original =
+    (YMGroupExitChatroomInfoOperatorFunc)YMGroupExitChatroomInfoOperatorRuntimeAddress;
+
+    try {
+        Original(a1);
+    } catch (...) {
+        YMLog(@"[GroupExitMonitor] exception while calling original chatroom_manager operator");
+    }
+
+    YMGroupExitReapplyChatroomInfoOperatorHook();
+    YMGroupExitCallingOriginalChatroomInfoOperator.store(false);
+}
+
+
+static BOOL YMGroupExitRestoreOriginalMemberDataList(void) {
+    if (!YMGroupExitMemberDataListRuntimeAddress || !YMGroupExitHasSavedOriginalMemberDataListBytes) {
+        return NO;
+    }
+
+    return YMGroupExitWriteCodeBytes(YMGroupExitMemberDataListRuntimeAddress,
+                                     YMGroupExitOriginalMemberDataListBytes,
+                                     sizeof(YMGroupExitOriginalMemberDataListBytes),
+                                     "group exit chatroom_manager::GetAllMemberDataList",
+                                     "restore original");
+}
+
+static BOOL YMGroupExitReapplyMemberDataListHook(void) {
+    if (!YMGroupExitMemberDataListRuntimeAddress) {
+        return NO;
+    }
+
+    return YMGroupExitWriteCodeBytes(YMGroupExitMemberDataListRuntimeAddress,
+                                     YMGroupExitHookMemberDataListBytes,
+                                     sizeof(YMGroupExitHookMemberDataListBytes),
+                                     "group exit chatroom_manager::GetAllMemberDataList",
+                                     "reapply hook");
+}
+
+static int64_t YMGroupExitCallOriginalMemberDataList(int64_t a1, int64_t *roomID, int64_t *outVector) {
+    if (!YMGroupExitMemberDataListRuntimeAddress) {
+        return 0;
+    }
+
+    if (YMGroupExitCallingOriginalMemberDataList.exchange(true)) {
+        YMLog(@"[GroupExitMonitor] recursive original GetAllMemberDataList call suppressed");
+        return 0;
+    }
+
+    BOOL restored = YMGroupExitRestoreOriginalMemberDataList();
+    if (!restored) {
+        YMLog(@"[GroupExitMonitor] restore original GetAllMemberDataList failed, skip calling original to avoid recursion");
+        YMGroupExitCallingOriginalMemberDataList.store(false);
+        return 0;
+    }
+
+    YMGroupExitMemberDataListFunc Original =
+    (YMGroupExitMemberDataListFunc)YMGroupExitMemberDataListRuntimeAddress;
+
+    int64_t result = 0;
+    try {
+        result = Original(a1, roomID, outVector);
+    } catch (...) {
+        YMLog(@"[GroupExitMonitor] exception while calling original GetAllMemberDataList");
+    }
+
+    YMGroupExitReapplyMemberDataListHook();
+    YMGroupExitCallingOriginalMemberDataList.store(false);
+    return result;
+}
+
+static void YMGroupExitDestroyLibcppStringObjectAt(uintptr_t stringObjectAddress) {
+    if (stringObjectAddress == 0) {
+        return;
+    }
+
+    uint8_t *object = (uint8_t *)stringObjectAddress;
+    int8_t flag = *(int8_t *)(object + 23);
+
+    if (flag < 0) {
+        void *data = *(void **)object;
+        if (data) {
+            operator delete(data);
+        }
+    }
+
+    memset(object, 0, 24);
+}
+
+static void YMGroupExitDestroyMemberDataListVector(int64_t *outVector) {
+    if (!outVector) {
+        return;
+    }
+
+    uintptr_t begin = (uintptr_t)outVector[0];
+    uintptr_t end = (uintptr_t)outVector[1];
+    uintptr_t cap = (uintptr_t)outVector[2];
+
+    outVector[0] = 0;
+    outVector[1] = 0;
+    outVector[2] = 0;
+
+    if (begin == 0 || end == 0 || end < begin || cap < end) {
+        return;
+    }
+
+    const size_t entrySize = 104;
+    uintptr_t byteSize = end - begin;
+    if (byteSize == 0 || (byteSize % entrySize) != 0 || byteSize > 104ULL * 20000ULL) {
+        return;
+    }
+
+    for (uintptr_t entry = begin; entry < end; entry += entrySize) {
+        YMGroupExitDestroyLibcppStringObjectAt(entry + 0);
+        YMGroupExitDestroyLibcppStringObjectAt(entry + 24);
+        YMGroupExitDestroyLibcppStringObjectAt(entry + 48);
+    }
+
+    operator delete((void *)begin);
+}
+
+static void YMGroupExitPreloadMemberDataListForRoom(int64_t manager, NSString *roomID, const char *source) {
+    if (!YMIsGroupExitMonitorEnabled() || manager == 0 || !YMGroupExitIsChatRoomID(roomID)) {
+        return;
+    }
+
+    std::string room = YMStdStringFromNSString(roomID);
+    if (room.empty()) {
+        return;
+    }
+
+    /*
+     修复堆的破话导致闪退
+     */
+    std::vector<YMGroupExitChatroomMemberUIData> members;
+
+    YMLog(@"[GroupExitMonitor] preload member data list start. source=%s room=%@ manager=0x%llx",
+          source ?: "",
+          roomID ?: @"",
+          (unsigned long long)manager);
+
+    int64_t result = YMGroupExitCallOriginalMemberDataList(manager,
+                                                           (int64_t *)&room,
+                                                           (int64_t *)&members);
+
+    uintptr_t begin = members.empty() ? 0 : (uintptr_t)members.data();
+    uintptr_t end = begin + members.size() * sizeof(YMGroupExitChatroomMemberUIData);
+    uintptr_t cap = begin + members.capacity() * sizeof(YMGroupExitChatroomMemberUIData);
+
+    YMLog(@"[GroupExitMonitor] preload member data list original result=0x%llx. source=%s room=%@ begin=0x%llx end=0x%llx count=%lu capacity=%lu",
+          (unsigned long long)result,
+          source ?: "",
+          roomID ?: @"",
+          (unsigned long long)begin,
+          (unsigned long long)end,
+          (unsigned long)members.size(),
+          (unsigned long)members.capacity());
+
+    if (result != 0 && begin != 0 && members.size() > 0 && members.size() <= 20000) {
+        int64_t vectorView[3] = {
+            (int64_t)begin,
+            (int64_t)end,
+            (int64_t)cap
+        };
+
+        YMGroupExitCacheMemberDataListFromOutVector(roomID,
+                                                    vectorView,
+                                                    source ?: "preload GetAllMemberDataList");
+    } else {
+        YMLog(@"[GroupExitMonitor] preload member data list skip cache. source=%s room=%@ result=0x%llx count=%lu",
+              source ?: "",
+              roomID ?: @"",
+              (unsigned long long)result,
+              (unsigned long)members.size());
+    }
+
+    // 不再手动 destroy vector。members 离开作用域时自动析构。
+    YMLog(@"[GroupExitMonitor] preload member data list finish. source=%s room=%@",
+          source ?: "",
+          roomID ?: @"");
+}
+
+static void YMGroupExitFlushPreloadRooms(const char *source) {
+    if (!YMIsGroupExitMonitorEnabled()) {
+        YMGroupExitClearRuntimeStateIfDisabled(source ?: "preload disabled");
+        return;
+    }
+
+    /*
+     如果当前还在 chatroom_manager::operator GetChatroomInfo 的原函数栈里，
+     不能从它内部触发的 fmessage/session 回调里反过来主动调用 GetAllMemberDataList。
+     这会形成 chatroom_manager 重入，轻则状态错乱，重则在原函数返回附近崩溃。
+     队列保留，等 operator 原函数真正返回后，hook 尾部会再 flush 一次。
+     */
+    if (YMGroupExitCallingOriginalChatroomInfoOperator.load()) {
+        YMLog(@"[GroupExitMonitor] preload deferred inside chatroom_manager operator. source=%s",
+              source ?: "");
+        return;
+    }
+
+    if (YMGroupExitPreloadingMemberDataList.exchange(true)) {
+        return;
+    }
+
+    YMGroupExitAtomicBoolResetGuard preloadGuard(&YMGroupExitPreloadingMemberDataList);
+
+    @autoreleasepool {
+        int64_t manager = YMGroupExitKnownChatroomManager.load();
+        if (manager == 0 || !YMGroupExitMemberDataListRuntimeAddress) {
+            NSMutableDictionary<NSString *, NSDate *> *queue = YMGroupExitPreloadRoomQueue();
+            NSUInteger count = 0;
+            @synchronized (queue) {
+                count = queue.count;
+            }
+            if (count > 0) {
+                YMLog(@"[GroupExitMonitor] preload pending but chatroom_manager is unknown. source=%s pending=%lu",
+                      source ?: "",
+                      (unsigned long)count);
+            }
+            return;
+        }
+
+        // 每次安全点只处理 1 个群，避免一次 fmessage/session 回调里连续扫多个大群。
+        NSArray<NSString *> *rooms = YMGroupExitDrainPreloadRooms(1);
+        if (rooms.count == 0) {
+            return;
+        }
+
+        YMLog(@"[GroupExitMonitor] flush preload rooms. source=%s count=%lu manager=0x%llx",
+              source ?: "",
+              (unsigned long)rooms.count,
+              (unsigned long long)manager);
+
+        for (NSString *roomID in rooms) {
+            if (!YMGroupExitIsChatRoomID(roomID)) {
+                continue;
+            }
+
+            YMGroupExitPreloadMemberDataListForRoom(manager, roomID, source ?: "flush preload rooms");
+        }
+    }
+}
+
+static void YMGroupExitCaptureChatroomManagerFromOperatorContext(int64_t context, const char *source) {
+    if (!YMIsGroupExitMonitorEnabled() || context == 0) {
+        return;
+    }
+
+    uintptr_t manager = 0;
+    if (!YMSafeReadPointer((uintptr_t)context + 8, &manager)) {
+        return;
+    }
+
+    if (manager == 0 || manager < 0x100000000ULL) {
+        return;
+    }
+
+    NSString *roomID = YMNSStringFromLibcppStringObject((const void *)((uintptr_t)context + 16));
+    if (!YMGroupExitIsChatRoomID(roomID)) {
+        return;
+    }
+
+    int64_t oldManager = YMGroupExitKnownChatroomManager.exchange((int64_t)manager);
+    if (oldManager != (int64_t)manager) {
+        YMLog(@"[GroupExitMonitor] chatroom_manager captured early. source=%s old=0x%llx new=0x%llx room=%@",
+              source ?: "",
+              (unsigned long long)oldManager,
+              (unsigned long long)manager,
+              roomID ?: @"");
+    }
+
+    YMGroupExitRequestPreloadRoom(roomID, @"chatroom_manager operator captured");
+}
+
+static void YMGroupExitChatroomInfoOperatorHook(int64_t a1) {
+    @autoreleasepool {
+        /*
+         只 hook sub_21249D4 这一处早期 operator：
+           a1 + 8  = chatroom_manager
+           a1 + 16 = 当前 roomID std::string
+         这里不做退群判断，也不直接插消息，只提前捕获 manager 并把当前群加入预热队列。
+         */
+        YMGroupExitCaptureChatroomManagerFromOperatorContext(a1, "chatroom_manager operator GetChatroomInfo");
+
+        YMGroupExitCallOriginalChatroomInfoOperator(a1);
+
+        if (YMIsGroupExitMonitorEnabled()) {
+            // 这个 operator 本身就是微信处理群信息的异步回调，原函数返回后尝试消费预热队列。
+            YMGroupExitFlushPreloadRooms("chatroom_manager operator GetChatroomInfo");
+        } else {
+            YMGroupExitClearRuntimeStateIfDisabled("chatroom_manager operator GetChatroomInfo");
+        }
+    }
+}
+
+static int64_t YMGroupExitMemberDataListHook(int64_t a1, int64_t *roomID, int64_t *outVector) {
+    @autoreleasepool {
+        if (a1 != 0) {
+            int64_t oldManager = YMGroupExitKnownChatroomManager.exchange(a1);
+            if (oldManager != a1) {
+                YMLog(@"[GroupExitMonitor] chatroom_manager captured. old=0x%llx new=0x%llx",
+                      (unsigned long long)oldManager,
+                      (unsigned long long)a1);
+            }
+        }
+
+        int64_t result = YMGroupExitCallOriginalMemberDataList(a1, roomID, outVector);
+
+        if (!YMIsGroupExitMonitorEnabled()) {
+            YMGroupExitClearRuntimeStateIfDisabled("GetAllMemberDataList hook");
+            return result;
+        }
+
+        NSString *roomIDText = YMNSStringFromLibcppStringObject((const void *)roomID);
+        YMGroupExitCacheMemberDataListFromOutVector(roomIDText,
+                                                    outVector,
+                                                    "chatroom_manager GetAllMemberDataList");
+
+        // 这里只缓存微信自己这次 GetAllMemberDataList 的结果。
+        // 不在 GetAllMemberDataList hook 内继续主动 preload 其它群，避免同 manager 重入。
+        return result;
+    }
+}
+
 static int64_t YMGroupExitDBApplyHook(int64_t task) {
     @autoreleasepool {
         if (!YMIsGroupExitMonitorEnabled()) {
@@ -2365,6 +3208,7 @@ static void YMGroupExitFMessagePreHook(int64_t a1, int64_t *a2) {
         YMGroupExitCallOriginalFMessagePre(a1, a2);
 
         if (YMIsGroupExitMonitorEnabled()) {
+            YMGroupExitFlushPreloadRooms("fmessage_manager InsertFMessageToSessionPre");
             YMGroupExitFlushPendingNotices("fmessage_manager InsertFMessageToSessionPre");
         } else {
             YMGroupExitClearRuntimeStateIfDisabled("fmessage_manager InsertFMessageToSessionPre");
@@ -2377,6 +3221,7 @@ static void YMGroupExitUpdateSessionCacheHook(uint64_t a1, int64_t a2, int64_t a
         YMGroupExitCallOriginalUpdateSessionCache(a1, a2, a3, a4);
 
         if (YMIsGroupExitMonitorEnabled()) {
+            YMGroupExitFlushPreloadRooms("session_service UpdateSessionCache");
             YMGroupExitFlushPendingNotices("session_service UpdateSessionCache");
         } else {
             YMGroupExitClearRuntimeStateIfDisabled("session_service UpdateSessionCache");
@@ -2454,10 +3299,14 @@ static BOOL YMPatchGroupExitMonitorWithSlide(intptr_t slide, NSString *source) {
     uintptr_t dbApplyTarget = YMRuntimeAddress(profile->groupExitDBApplyVA);
     uintptr_t fmessagePreTarget = YMRuntimeAddress(profile->groupExitFMessagePreVA);
     uintptr_t updateSessionCacheTarget = YMRuntimeAddress(profile->groupExitUpdateSessionCacheVA);
+    uintptr_t memberDataListTarget = YMRuntimeAddress(profile->groupExitMemberDataListVA);
+    uintptr_t chatroomInfoOperatorTarget = YMRuntimeAddress(profile->groupExitChatroomInfoOperatorVA);
 
     uintptr_t dbApplyHook = (uintptr_t)&YMGroupExitDBApplyHook;
     uintptr_t fmessagePreHook = (uintptr_t)&YMGroupExitFMessagePreHook;
     uintptr_t updateSessionCacheHook = (uintptr_t)&YMGroupExitUpdateSessionCacheHook;
+    uintptr_t memberDataListHook = (uintptr_t)&YMGroupExitMemberDataListHook;
+    uintptr_t chatroomInfoOperatorHook = (uintptr_t)&YMGroupExitChatroomInfoOperatorHook;
 
     BOOL okDBApply = YMPatchGroupExitSingleFunction(dbApplyTarget,
                                                    dbApplyHook,
@@ -2486,16 +3335,48 @@ static BOOL YMPatchGroupExitMonitorWithSlide(intptr_t slide, NSString *source) {
                                                               "group exit session_service::UpdateSessionCache",
                                                               source);
 
-    BOOL ok = okDBApply && okFMessagePre && okUpdateSessionCache;
+    BOOL okMemberDataList = YES;
+    if (memberDataListTarget != 0) {
+        okMemberDataList = YMPatchGroupExitSingleFunction(memberDataListTarget,
+                                                          memberDataListHook,
+                                                          YMGroupExitOriginalMemberDataListBytes,
+                                                          YMGroupExitHookMemberDataListBytes,
+                                                          &YMGroupExitHasSavedOriginalMemberDataListBytes,
+                                                          &YMGroupExitMemberDataListRuntimeAddress,
+                                                          "group exit chatroom_manager::GetAllMemberDataList",
+                                                          source);
+    } else {
+        YMLog(@"[GroupExitMonitor] GetAllMemberDataList address is zero, nickname cache hook skipped. profile=%s",
+              profile ? profile->displayName : "NULL");
+    }
 
-    YMLog(@"[GroupExitMonitor] patch result=%@ source=%@ profile=%s slide=0x%lx DBApply=0x%lx FMessagePre=0x%lx UpdateSessionCache=0x%lx",
+    BOOL okChatroomInfoOperator = YES;
+    if (chatroomInfoOperatorTarget != 0) {
+        okChatroomInfoOperator = YMPatchGroupExitSingleFunction(chatroomInfoOperatorTarget,
+                                                                chatroomInfoOperatorHook,
+                                                                YMGroupExitOriginalChatroomInfoOperatorBytes,
+                                                                YMGroupExitHookChatroomInfoOperatorBytes,
+                                                                &YMGroupExitHasSavedOriginalChatroomInfoOperatorBytes,
+                                                                &YMGroupExitChatroomInfoOperatorRuntimeAddress,
+                                                                "group exit chatroom_manager::operator GetChatroomInfo",
+                                                                source);
+    } else {
+        YMLog(@"[GroupExitMonitor] chatroom_manager operator address is zero, early manager capture hook skipped. profile=%s",
+              profile ? profile->displayName : "NULL");
+    }
+
+    BOOL ok = okDBApply && okFMessagePre && okUpdateSessionCache && okMemberDataList && okChatroomInfoOperator;
+
+    YMLog(@"[GroupExitMonitor] patch result=%@ source=%@ profile=%s slide=0x%lx DBApply=0x%lx FMessagePre=0x%lx UpdateSessionCache=0x%lx MemberDataList=0x%lx ChatroomInfoOperator=0x%lx",
           ok ? @"OK" : @"FAIL",
           source ?: @"",
           profile->displayName,
           (unsigned long)YMWeChatDylibSlide,
           (unsigned long)dbApplyTarget,
           (unsigned long)fmessagePreTarget,
-          (unsigned long)updateSessionCacheTarget);
+          (unsigned long)updateSessionCacheTarget,
+          (unsigned long)memberDataListTarget,
+          (unsigned long)chatroomInfoOperatorTarget);
 
     YMHasPatchedGroupExitMonitor = ok;
     return ok;
@@ -2533,12 +3414,6 @@ static BOOL YMFindAndPatchLoadedGroupExitWeChatDylib(void) {
 }
 
 static void YMInstallGroupExitMonitorPatch(void) {
-    if (!YMIsGroupExitMonitorEnabled()) {
-        YMLog(@"[GroupExitMonitor] disabled by user defaults, skip install");
-        YMGroupExitClearRuntimeStateIfDisabled("install skip");
-        return;
-    }
-
     if (YMHasPatchedGroupExitMonitor) {
         return;
     }
@@ -3648,6 +4523,85 @@ static void YMInstallMultiOpenPatch(void) {
     YMFindAndPatchLoadedMultiOpenWeChatDylib();
 }
 
+#pragma mark - URL 外部浏览器 Patch
+
+static BOOL YMPatchOpenURLWithSystemBrowserWithSlide(intptr_t slide, NSString *source) {
+    if (YMHasPatchedOpenURLWithSystemBrowser) {
+        YMLog(@"open url system browser already patched, skip. source=%@", source ?: @"");
+        return YES;
+    }
+
+    if (!YMIsTargetWeChatVersion()) {
+        YMLog(@"open url system browser unsupported version, skip. source=%@", source ?: @"");
+        return NO;
+    }
+
+    const YMWeChatAdaptProfile *profile = YMGetActiveProfile();
+    if (!profile || profile->openURLWebViewKindVA == 0) {
+        YMLog(@"open url system browser address is zero, skip. profile=%s", profile ? profile->displayName : "NULL");
+        return NO;
+    }
+
+    YMWeChatDylibSlide = (uintptr_t)slide;
+
+    uintptr_t address = YMRuntimeAddress(profile->openURLWebViewKindVA);
+    YMLog(@"try install open url system browser patch from %@, profile=%s, slide=0x%lx, GetUrlWebViewKind=0x%lx",
+          source ?: @"",
+          profile->displayName,
+          (unsigned long)YMWeChatDylibSlide,
+          (unsigned long)address);
+
+    // 3 = use sys。
+    BOOL ok = YMPatchARM64ReturnInt32(address,
+                                      3,
+                                      "open url: GetUrlWebViewKind -> return 3");
+
+    YMHasPatchedOpenURLWithSystemBrowser = ok;
+    return ok;
+}
+
+static BOOL YMFindAndPatchLoadedOpenURLWithSystemBrowserDylib(void) {
+    uint32_t count = _dyld_image_count();
+
+    YMLog(@"scan dyld images for open url system browser, count=%u", count);
+
+    for (uint32_t i = 0; i < count; i++) {
+        const char *name = _dyld_get_image_name(i);
+        if (!name) {
+            continue;
+        }
+
+        NSString *imagePath = [NSString stringWithUTF8String:name];
+
+        if (!YMIsTargetWeChatResourceDylibPath(imagePath)) {
+            continue;
+        }
+
+        intptr_t slide = _dyld_get_image_vmaddr_slide(i);
+
+        YMLog(@"found Resources/wechat.dylib for open url system browser: index=%u, slide=0x%lx, path=%@",
+              i,
+              (unsigned long)slide,
+              imagePath);
+
+        return YMPatchOpenURLWithSystemBrowserWithSlide(slide, @"dyld image scan");
+    }
+
+    YMLog(@"Resources/wechat.dylib not found for open url system browser");
+    return NO;
+}
+
+static void YMInstallOpenURLWithSystemBrowserPatch(void) {
+    if (YMHasPatchedOpenURLWithSystemBrowser) {
+        return;
+    }
+
+    YMRegisterDyldCallbackIfNeeded();
+    YMFindAndPatchLoadedOpenURLWithSystemBrowserDylib();
+}
+
+
+#pragma mark - tool
 static void YMDyldImageAdded(const struct mach_header *mh, intptr_t vmaddr_slide) {
     const char *name = NULL;
 
@@ -3679,21 +4633,15 @@ static void YMDyldImageAdded(const struct mach_header *mh, intptr_t vmaddr_slide
      */
     YMPatchMultiOpenWithWeChatDylibSlide(vmaddr_slide, @"dyld add image callback");
 
-    /*
-     群员退群监控受 kExitChatroom 控制。
-     注意：dyld callback 是多开/防撤回共用的，不能在这里无条件安装退群 hook。
-     */
-    if (YMIsGroupExitMonitorEnabled()) {
-        YMPatchGroupExitMonitorWithSlide(vmaddr_slide, @"dyld add image callback");
-    } else {
-        YMLog(@"[GroupExitMonitor] disabled by user defaults, skip dyld callback patch");
-        YMGroupExitClearRuntimeStateIfDisabled("dyld add image callback");
+    if (YMIsOpenURLWithSystemBrowserEnabled()) {
+        YMPatchOpenURLWithSystemBrowserWithSlide(vmaddr_slide, @"dyld add image callback");
     }
 
-    /*
-     防撤回仍然受用户开关控制。
-     */
-    if ([[NSUserDefaults standardUserDefaults] boolForKey:kAntiRevoke]) {
+    if (YMIsGroupExitMonitorEnabled()) {
+        YMPatchGroupExitMonitorWithSlide(vmaddr_slide, @"dyld add image callback");
+    }
+
+    if (YMIsAntiRevokeEnabled()) {
         YMPatchAntiRevokeWithSlide(vmaddr_slide, @"dyld add image callback");
     }
 }
@@ -3719,37 +4667,25 @@ static void YMInstallAssistantMenu(void) {
 }
 
 static void YMInstallAntiUpdateIfNeeded(void) {
+    if (!YMFeatureAntiUpdateEnabled) {
+        YMLog(@"anti update disabled, skip");
+        return;
+    }
+
     dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(1 * NSEC_PER_SEC)),
                    dispatch_get_main_queue(), ^{
-        NSString *loadFlag = [[NSUserDefaults standardUserDefaults] objectForKey:kIsFirstLoad];
-        if (loadFlag.length < 3) {
-            [[NSUserDefaults standardUserDefaults] setBool:YES forKey:kAntiUpdate];
-            [[NSUserDefaults standardUserDefaults] setObject:@"SOVIET" forKey:kIsFirstLoad];
-        }
-
-        if ([[NSUserDefaults standardUserDefaults] boolForKey:kAntiUpdate]) {
-            YMDisableSparkleAutoUpdateDefaults();
-            YMDisableSparkleByRuntimeHook();
-        }
+        YMDisableSparkleAutoUpdateDefaults();
+        YMDisableSparkleByRuntimeHook();
     });
 }
 
 static void YMInstallAntiRevokeIfNeeded(void) {
-    if (![[NSUserDefaults standardUserDefaults] boolForKey:kAntiRevoke]) {
-        YMLog(@"anti revoke disabled by user defaults, skip");
+    if (!YMIsAntiRevokeEnabled()) {
+        YMLog(@"anti revoke disabled, skip");
         return;
     }
 
-    /*
-     先注册 dyld 回调。
-     如果 wechat.dylib 在之后加载，可以第一时间拿到 slide。
-    */
     YMRegisterDyldCallbackIfNeeded();
-
-    /*
-     再主动扫描一次。
-     如果 wechat.dylib 在之前已经加载，可以直接安装 hook。
-    */
     YMInstallAntiRevokePatch();
 
     dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(1 * NSEC_PER_SEC)),
@@ -3763,6 +4699,39 @@ static void YMInstallAntiRevokeIfNeeded(void) {
     });
 }
 
+static void YMInstallGroupExitMonitorIfNeeded(void) {
+    if (!YMIsGroupExitMonitorEnabled()) {
+        YMLog(@"[GroupExitMonitor] disabled, skip");
+        YMGroupExitClearRuntimeStateIfDisabled("constructor skip");
+        return;
+    }
+
+    YMInstallGroupExitMonitorPatch();
+
+    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(1 * NSEC_PER_SEC)),
+                   dispatch_get_main_queue(), ^{
+        YMInstallGroupExitMonitorPatch();
+    });
+
+    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(3 * NSEC_PER_SEC)),
+                   dispatch_get_main_queue(), ^{
+        YMInstallGroupExitMonitorPatch();
+    });
+}
+
+static void YMInstallOpenURLWithSystemBrowserIfNeeded(void) {
+    if (!YMIsOpenURLWithSystemBrowserEnabled()) {
+        YMLog(@"open url system browser disabled, skip");
+        return;
+    }
+
+    YMInstallOpenURLWithSystemBrowserPatch();
+
+    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(1 * NSEC_PER_SEC)),
+                   dispatch_get_main_queue(), ^{
+        YMInstallOpenURLWithSystemBrowserPatch();
+    });
+}
 
 #pragma mark - 撤回路径诊断（x86_64 instrument-and-observe）
 /*
@@ -3912,75 +4881,36 @@ static void YMInstallRevokeDiag(void) {}
 
 #pragma mark - constructor
 
+#pragma mark - 开关
+
+static void YMLoadFeatureSwitchesFromDefaults(void) {
+    NSUserDefaults *defaults = [NSUserDefaults standardUserDefaults];
+
+    NSString *loadFlag = [defaults objectForKey:kIsFirstLoad];
+    if (loadFlag.length < 3) {
+        [defaults setBool:YES forKey:kAntiUpdate];
+        [defaults setObject:@"SOVIET" forKey:kIsFirstLoad];
+    }
+
+    YMFeatureAntiUpdateEnabled = [defaults boolForKey:kAntiUpdate];
+    YMFeatureAntiRevokeEnabled = [defaults boolForKey:kAntiRevoke];
+    YMFeatureGroupExitMonitorEnabled = [defaults boolForKey:kExitChatroom];
+    YMFeatureOpenURLWithSystemBrowserEnabled = [defaults boolForKey:kUseSystemWeb];
+}
+
 __attribute__((constructor))
 static void YMWeChatAntiRevokePatchEntry(void) {
     @autoreleasepool {
         YMLog(@"constructor called");
-        /// 多开必须尽早执行，不能 dispatch_after。
+        
+        YMLoadFeatureSwitchesFromDefaults();
+
         YMInstallMultiOpenPatch();
-
-        BOOL exitChat = [[NSUserDefaults standardUserDefaults] boolForKey:kExitChatroom];
-        if (exitChat) {
-            YMInstallGroupExitMonitorPatch();
-            dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(1 * NSEC_PER_SEC)),
-                           dispatch_get_main_queue(), ^{
-                YMInstallGroupExitMonitorPatch();
-            });
-            dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(3 * NSEC_PER_SEC)),
-                           dispatch_get_main_queue(), ^{
-                YMInstallGroupExitMonitorPatch();
-            });
-        }
         
-
-        dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(2 * NSEC_PER_SEC)),
-                       dispatch_get_main_queue(), ^{
-            [[MenuManager shareInstance] initAssistantMenuItems];
-        });
-        
-        dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(1 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
-            NSString *loadFlag = [[NSUserDefaults standardUserDefaults] objectForKey:kIsFirstLoad];
-            if (loadFlag.length < 3) {
-                [[NSUserDefaults standardUserDefaults] setBool:YES forKey:kAntiUpdate];
-                [[NSUserDefaults standardUserDefaults] setObject:@"SOVIET" forKey:kIsFirstLoad];
-            }
-            
-            if ([[NSUserDefaults standardUserDefaults] boolForKey:kAntiUpdate]) {
-                YMDisableSparkleAutoUpdateDefaults();
-                YMDisableSparkleByRuntimeHook();
-            }
-        });
-        
-        
-        if ([[NSUserDefaults standardUserDefaults] boolForKey:kAntiRevoke]) {
-            /*
-             先注册 dyld 回调。
-             如果 wechat.dylib 在之后加载，可以第一时间拿到 slide。
-            */
-            YMRegisterDyldCallbackIfNeeded();
-
-            /*
-             再主动扫描一次。
-             如果 wechat.dylib 在之前已经加载，可以直接安装 hook。
-            */
-            YMInstallAntiRevokePatch();
-            // 诊断模块已完成定位，正式补丁阶段关闭，避免热函数 hook 的噪声/开销。
-            // 需再次插桩时取消注释 YMInstallRevokeDiag()。
-            // YMInstallRevokeDiag();
-
-            dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(1 * NSEC_PER_SEC)),
-                           dispatch_get_main_queue(), ^{
-                YMInstallAntiRevokePatch();
-                // YMInstallRevokeDiag();
-            });
-
-            dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(3 * NSEC_PER_SEC)),
-                           dispatch_get_main_queue(), ^{
-                YMInstallAntiRevokePatch();
-                // YMInstallRevokeDiag();
-            });
-        }
-
+        YMInstallOpenURLWithSystemBrowserIfNeeded();
+        YMInstallGroupExitMonitorIfNeeded();
+        YMInstallAssistantMenu();
+        YMInstallAntiUpdateIfNeeded();
+        YMInstallAntiRevokeIfNeeded();
     }
 }
-

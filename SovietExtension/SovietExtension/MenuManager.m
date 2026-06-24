@@ -11,8 +11,12 @@
 #import "YMSwizzledHelper.h"
 
 @implementation MenuManager
-+ (instancetype)shareInstance {
-    static id share = nil;
+
+#pragma mark - Singleton
+
++ (instancetype)shareInstance
+{
+    static MenuManager *share = nil;
     static dispatch_once_t onceToken;
     dispatch_once(&onceToken, ^{
         share = [[self alloc] init];
@@ -20,102 +24,87 @@
     return share;
 }
 
+#pragma mark - Public
+
 - (void)initAssistantMenuItems
 {
-    BOOL flag_update = [[NSUserDefaults standardUserDefaults] boolForKey:kAntiUpdate];
-    NSMenuItem *antiUpdateMenu = [NSMenuItem menuItemWithTitle:@"阻止更新"
-                                                       action:@selector(onAntiUpdate:)
-                                                       target:self
-                                                keyEquivalent:@""
-                                                        state:flag_update];
+    NSMenuItem *antiUpdateMenu = [self ym_toggleMenuItemWithTitle:@"阻止更新"
+                                                              key:kAntiUpdate
+                                                           action:@selector(onAntiUpdate:)];
     
-    BOOL flag_revoke = [[NSUserDefaults standardUserDefaults] boolForKey:kAntiRevoke];
-    NSMenuItem *antiRevokeMenu= [NSMenuItem menuItemWithTitle:@"消息防撤回"
-                                                       action:@selector(onAntiRevoke:)
-                                                       target:self
-                                                keyEquivalent:@""
-                                                        state:flag_revoke];
+    NSMenuItem *antiRevokeMenu = [self ym_toggleMenuItemWithTitle:@"消息防撤回"
+                                                              key:kAntiRevoke
+                                                           action:@selector(onAntiRevoke:)];
     
-    NSMenuItem *newWeChatMenu= [NSMenuItem menuItemWithTitle:@"多开"
+    NSMenuItem *exitChatroomMenu = [self ym_toggleMenuItemWithTitle:@"退群监控"
+                                                                key:kExitChatroom
+                                                             action:@selector(onExitChatroom:)];
+    
+    NSMenuItem *useSystemWebMenu = [self ym_toggleMenuItemWithTitle:@"使用系统浏览器"
+                                                                key:kUseSystemWeb
+                                                             action:@selector(onUseSystemWeb:)];
+    
+    NSMenuItem *newWeChatMenu = [NSMenuItem menuItemWithTitle:@"多开"
                                                        action:@selector(onNewWeChat:)
                                                        target:self
                                                 keyEquivalent:@""
                                                         state:NO];
     
-    BOOL flag_kExitChatroom = [[NSUserDefaults standardUserDefaults] boolForKey:kExitChatroom];
-    NSMenuItem *exitChatroomMenu= [NSMenuItem menuItemWithTitle:@"退群监控"
-                                                       action:@selector(onExitChatroom:)
-                                                       target:self
-                                                keyEquivalent:@""
-                                                        state:flag_kExitChatroom];
-    
-   
     NSString *version = [NSString stringWithFormat:@"当前版本 %@", kCurrentVersion];
-    NSMenuItem *currentVersionMenu= [NSMenuItem menuItemWithTitle:version
-                                                       action:nil
-                                                       target:self
-                                                keyEquivalent:@""
-                                                        state:NO];
+    NSMenuItem *currentVersionMenu = [NSMenuItem menuItemWithTitle:version
+                                                            action:nil
+                                                            target:self
+                                                     keyEquivalent:@""
+                                                             state:NO];
+    currentVersionMenu.enabled = NO;
     
     NSMenu *subMenu = [[NSMenu alloc] initWithTitle:@"苏维埃助手"];
-    [subMenu addItems:@[antiUpdateMenu,
-                        antiRevokeMenu,
-                        exitChatroomMenu,
-                        newWeChatMenu,
-                        currentVersionMenu
-                      ]];
+    [subMenu addItems:@[
+        antiUpdateMenu,
+        antiRevokeMenu,
+        exitChatroomMenu,
+        useSystemWebMenu,
+        newWeChatMenu,
+        currentVersionMenu
+    ]];
     
     NSMenuItem *menuItem = [[NSMenuItem alloc] init];
+    menuItem.title = @"苏维埃助手";
     menuItem.target = self;
     menuItem.enabled = YES;
-    [menuItem setTitle:@"苏维埃助手"];
-    [menuItem setSubmenu:subMenu];
-    [[[NSApplication sharedApplication] mainMenu] addItem:menuItem];
+    menuItem.submenu = subMenu;
     
+    [[[NSApplication sharedApplication] mainMenu] addItem:menuItem];
 }
+
+#pragma mark - Menu Actions
 
 - (void)onAntiUpdate:(NSMenuItem *)item
 {
-    BOOL enabled = item.state != NSControlStateValueOn;
-    
-    NSAlert *alert = [NSAlert alertWithMessageText:@"警告"
-                                     defaultButton:@"取消"                      
-                                   alternateButton:@"确定重启"
-                                       otherButton:nil
-                         informativeTextWithFormat:@"非必要情况千万不要关闭`禁止更新`,否则微信自动更新导致插件失效"];
-    NSUInteger action = [alert runModal];
-    if (action == NSAlertAlternateReturn) {
-        item.state = enabled ? NSControlStateValueOn : NSControlStateValueOff;
-        [[NSUserDefaults standardUserDefaults] setBool:enabled forKey:kAntiUpdate];
-        [[NSUserDefaults standardUserDefaults] synchronize];
-        dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.5 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
-            [self restartWeChat];
-        });
-    }  else if (action == NSAlertDefaultReturn) {
-        
-    }
+    [self ym_confirmToggleMenuItem:item
+                   userDefaultsKey:kAntiUpdate
+                   informativeText:@"非必要情况千万不要关闭`禁止更新`,否则微信自动更新导致插件失效"];
 }
 
 - (void)onAntiRevoke:(NSMenuItem *)item
 {
-    BOOL enabled = item.state != NSControlStateValueOn;
-    
-    NSAlert *alert = [NSAlert alertWithMessageText:@"警告"
-                                     defaultButton:@"取消"
-                                   alternateButton:@"确定重启"
-                                       otherButton:nil
-                         informativeTextWithFormat:@"重启微信生效"];
-    NSUInteger action = [alert runModal];
-    if (action == NSAlertAlternateReturn) {
-        item.state = enabled ? NSControlStateValueOn : NSControlStateValueOff;
-        [[NSUserDefaults standardUserDefaults] setBool:enabled forKey:kAntiRevoke];
-        [[NSUserDefaults standardUserDefaults] synchronize];
-        dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.5 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
-            [self restartWeChat];
-        });
-    }  else if (action == NSAlertDefaultReturn) {
-        
-    }
+    [self ym_confirmToggleMenuItem:item
+                   userDefaultsKey:kAntiRevoke
+                   informativeText:@"重启微信生效"];
+}
+
+- (void)onExitChatroom:(NSMenuItem *)item
+{
+    [self ym_confirmToggleMenuItem:item
+                   userDefaultsKey:kExitChatroom
+                   informativeText:@"重启微信生效"];
+}
+
+- (void)onUseSystemWeb:(NSMenuItem *)item
+{
+    [self ym_confirmToggleMenuItem:item
+                   userDefaultsKey:kUseSystemWeb
+                   informativeText:@"重启微信生效"];
 }
 
 - (void)onNewWeChat:(NSMenuItem *)item
@@ -123,7 +112,24 @@
     [self executeShellCommand:@"open -n /Applications/WeChat.app"];
 }
 
-- (void)onExitChatroom:(NSMenuItem *)item
+#pragma mark - Menu Helpers
+
+- (NSMenuItem *)ym_toggleMenuItemWithTitle:(NSString *)title
+                                       key:(NSString *)key
+                                    action:(SEL)action
+{
+    BOOL enabled = [[NSUserDefaults standardUserDefaults] boolForKey:key];
+    
+    return [NSMenuItem menuItemWithTitle:title
+                                  action:action
+                                  target:self
+                           keyEquivalent:@""
+                                   state:enabled];
+}
+
+- (void)ym_confirmToggleMenuItem:(NSMenuItem *)item
+                 userDefaultsKey:(NSString *)key
+                 informativeText:(NSString *)informativeText
 {
     BOOL enabled = item.state != NSControlStateValueOn;
     
@@ -131,41 +137,75 @@
                                      defaultButton:@"取消"
                                    alternateButton:@"确定重启"
                                        otherButton:nil
-                         informativeTextWithFormat:@"重启微信生效"];
+                         informativeTextWithFormat:@"%@", informativeText];
+    
     NSUInteger action = [alert runModal];
-    if (action == NSAlertAlternateReturn) {
-        item.state = enabled ? NSControlStateValueOn : NSControlStateValueOff;
-        [[NSUserDefaults standardUserDefaults] setBool:enabled forKey:kExitChatroom];
-        [[NSUserDefaults standardUserDefaults] synchronize];
-        dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.5 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
-            [self restartWeChat];
-        });
-    }  else if (action == NSAlertDefaultReturn) {
-        
+    if (action != NSAlertAlternateReturn) {
+        return;
     }
+    
+    [self ym_setMenuItem:item enabled:enabled userDefaultsKey:key];
+    [self ym_restartWeChatAfterDelay:0.5];
+}
+
+- (void)ym_setMenuItem:(NSMenuItem *)item
+               enabled:(BOOL)enabled
+       userDefaultsKey:(NSString *)key
+{
+    item.state = enabled ? NSControlStateValueOn : NSControlStateValueOff;
+    
+    NSUserDefaults *defaults = [NSUserDefaults standardUserDefaults];
+    [defaults setBool:enabled forKey:key];
+    [defaults synchronize];
+}
+
+#pragma mark - WeChat
+
+- (void)ym_restartWeChatAfterDelay:(NSTimeInterval)delay
+{
+    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(delay * NSEC_PER_SEC)),
+                   dispatch_get_main_queue(), ^{
+        [self restartWeChat];
+    });
 }
 
 - (void)restartWeChat
 {
-    dispatch_async(dispatch_get_main_queue(), ^{
-        NSString *cmd = @"killall WeChat && open /Applications/WeChat.app";
+    dispatch_async(dispatch_get_global_queue(DISPATCH_QUEUE_PRIORITY_DEFAULT, 0), ^{
+        NSString *cmd = @"killall WeChat; sleep 0.5; open /Applications/WeChat.app";
         [self executeShellCommand:cmd];
     });
 }
 
+#pragma mark - Shell
+
 - (NSString *)executeShellCommand:(NSString *)cmd
 {
-    NSTask *task = [[NSTask alloc] init];
-    [task setLaunchPath:@"/bin/bash"];
-    [task setArguments:@[@"-c", cmd]];
-    // 新建输出管道作为Task的错误输出
-    NSPipe *errorPipe = [NSPipe pipe];
-    [task setStandardError:errorPipe];
-    NSFileHandle *file = [errorPipe fileHandleForReading];
-    // 获取运行结果
-    [task launch];
-    NSData *data = [file readDataToEndOfFile];
+    if (cmd.length == 0) {
+        return @"";
+    }
     
-    return [[NSString alloc] initWithData:data encoding:NSUTF8StringEncoding];
+    NSTask *task = [[NSTask alloc] init];
+    task.launchPath = @"/bin/bash";
+    task.arguments = @[@"-c", cmd];
+    
+    NSPipe *pipe = [NSPipe pipe];
+    task.standardOutput = pipe;
+    task.standardError = pipe;
+    
+    NSFileHandle *fileHandle = [pipe fileHandleForReading];
+    
+    @try {
+        [task launch];
+    } @catch (NSException *exception) {
+        return exception.reason ?: @"";
+    }
+    
+    NSData *data = [fileHandle readDataToEndOfFile];
+    [task waitUntilExit];
+    
+    NSString *result = [[NSString alloc] initWithData:data encoding:NSUTF8StringEncoding];
+    return result ?: @"";
 }
+
 @end
