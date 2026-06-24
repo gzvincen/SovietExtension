@@ -55,6 +55,7 @@ typedef enum {
     YMRevokeHookModeInline  = 1,   // 4.1.10：patch 局部指令点
     YMRevokeHookModeBlockEntry = 2,// x86_64 MVP：直接 patch 撤回处理函数入口 return，阻断撤回（原消息保留）
     YMRevokeHookModeBlockEntryNotice = 3,// x86_64：detour 撤回 handler 入口→插本地灰条提示后 return YES 阻断
+    YMRevokeHookModeX86Callsite = 4,     // x86_64：换 CoReplace 里查原消息的 call 目标→捕获原文+清替换标志(ARM 同机制)
 } YMRevokeHookMode;
 
 #pragma mark - MessageWrap 字段布局
@@ -323,8 +324,13 @@ static const YMWeChatAdaptProfile YMAdaptProfiles[] = {
         //   阻断点取最顶层撤回 wrapper 0x2bd6250，入口 patch 成 return YES(mov eax,1)：
         //   上层认为已处理(不重试/不脱)，但 CoReplace/下游删除全不执行→原消息保留。
         //   （旧候选 0x2b93f40 不在本(1v1)撤回链上，故此前 block 无效。）
-        .hookMode = YMRevokeHookModeBlockEntryNotice,
-        .hookPointerVA = 0x2bd6250,
+        // ✅ 防撤回 callsite 捕获(ARM 同机制，显示原文/昵称，不动 DB)：
+        //   hookPointerVA = CoReplace(0x2f93440) 里查原消息那条 call 的 VA。
+        //   wrapper 调真正查询拿到原消息→捕获 content/type/time/session(偏移同 arm64)
+        //   →插带原文详细灰条→清 outWrap+616 替换标志阻止 UI 替换。
+        //   备选：BlockEntryNotice@0x2bd6250(只阻断+概要提示，已实测稳)。
+        .hookMode = YMRevokeHookModeX86Callsite,
+        .hookPointerVA = 0x2f93eb1,
 
         // ✅ 防撤回 notice（运行时+结构指纹确认，用于阻断后本地补一条灰条提示）：
         //   rawMessageTemplate: 0x2bd6250 里 memcpy 源(616B sysmsg 模板)。
@@ -618,6 +624,12 @@ static BOOL YMProfileHasAntiRevokeAddresses(const YMWeChatAdaptProfile *profile)
     // notice 4 件套缺失时 YMInsertLocalAntiRevokeNotice 会优雅失败，但仍阻断。
     if (profile->hookMode == YMRevokeHookModeBlockEntryNotice) {
         return profile->hookPointerVA != 0;
+    }
+
+    // X86Callsite：换查原消息的 call 目标。需要 callsite VA + insert 函数(出原文提示)。
+    if (profile->hookMode == YMRevokeHookModeX86Callsite) {
+        return profile->hookPointerVA != 0 &&
+               profile->insertPaySysMsgToSessionVA != 0;
     }
 
     BOOL baseOK = profile->rawMessageTemplateVA != 0 &&
@@ -3226,6 +3238,135 @@ static int64_t YMRevokeBlockNoticeHandler(int64_t a0, int64_t a1, int64_t a2,
     return 1; // 告诉 sync 层撤回已处理，且不调用原函数 → 阻断
 }
 
+#pragma mark - 防撤回 x86 callsite 捕获（ARM 同机制：拦原消息查询，不动 DB）
+
+/*
+ 思路（对应 ARM 的 callsite hook，但用更安全的"换 call 目标"实现）：
+ x86 CoReplaceOriginMessageByRevoke(0x2f93440) 里查原消息：
+   0x2f93e95 mov rdx,[rbp-0x660]         ; rdx = extObject(ctx)，svrId@+0x168 session@+0x188
+   0x2f93e9c mov rcx,[rdx+0x168]         ; rcx = svrId
+   0x2f93ea3 add rdx,0x188              ; rdx = ctx+0x188(session 串地址)
+   0x2f93eaa lea rdi,[rbp-0x910]         ; rdi = outWrap(被填充的原消息 wrap)
+   0x2f93eb1 call 0x2ba12c0              ; 查到原消息，填入 outWrap
+ 把这条 call 的目标(rel32)改成下面的 wrapper：先调真正的查询拿到原消息，
+ 再从 outWrap/extObject 捕获 content/type/time/session(偏移与 arm64 一致)，
+ 插入带原文的详细灰条，最后把 outWrap+616 的"替换标志"清 0 阻止 UI 替换。
+ 整条 callsite 唯一，天然只在撤回时触发；不需要寄存器保存跳板。
+*/
+static uintptr_t YMRevokeX86RealLookupAddr = 0;
+typedef int64_t (*YMRevokeX86LookupFunc)(int64_t,int64_t,int64_t,int64_t,int64_t,int64_t);
+
+static void YMRevokeX86CaptureFromCoReplace(uintptr_t outWrap, uintptr_t extObject, uint64_t svrId) {
+    if (outWrap == 0 || extObject == 0) {
+        return;
+    }
+
+    // 原消息是否有效：outWrap+616 == 1 表示这次确实替换了原消息。
+    uint8_t hasValue = 0;
+    YMSafeReadMemory(outWrap + 616, &hasValue, sizeof(hasValue));
+    if (hasValue == 0) {
+        return;
+    }
+
+    uint32_t originType = 0;
+    uint64_t originCreateTimeMs = 0;
+    uint32_t originCreateTimeSec = 0;
+    YMSafeReadMemory(outWrap + 264, &originType, sizeof(originType));
+    YMSafeReadMemory(outWrap + 256, &originCreateTimeMs, sizeof(originCreateTimeMs));
+    YMSafeReadMemory(outWrap + 276, &originCreateTimeSec, sizeof(originCreateTimeSec));
+
+    // 用 ->c_str() 路径(YMNSStringFromStdString)读，YMNSStringFromLibcppStringObject 在
+    // x86 上对这些 std::string 解析为空(实测 session 用 c_str 能拿到 wxid，用它则空)。
+    NSString *originContent = YMNSStringFromStdString((std::string *)(outWrap + 304));
+    std::string *sessionString = (std::string *)(extObject + 392);
+    NSString *sessionText = YMNSStringFromStdString(sessionString);
+
+    YMLog(@"[X86Callsite] origin captured svrId=%llu type=%u session=%@ contentLen=%lu",
+          (unsigned long long)svrId, (unsigned int)originType,
+          sessionText ?: @"", (unsigned long)originContent.length);
+
+    // 撤回人：1v1 时即会话对方(sessionText)。后续可从撤回上下文补 replacemsg 昵称。
+    YMInsertDetailedAntiRevokeNoticeFromOrigin(sessionString,
+                                               sessionText,
+                                               svrId,
+                                               originType,
+                                               originContent,
+                                               originCreateTimeMs,
+                                               originCreateTimeSec,
+                                               sessionText,   // revokerWxid（1v1 近似）
+                                               @"",            // revokerDisplayName
+                                               @"",            // replaceMsg
+                                               @"",            // msgID
+                                               @"");           // newMsgID
+
+    // 关键：清掉"替换原消息"的标志，阻止后续 UI 把原消息替换成撤回提示。
+    // outWrap 已校验非空且 hasValue 读取成功，是合法可写内存，直接写。
+    *((volatile uint8_t *)(outWrap + 616)) = 0;
+}
+
+// 换 call 目标后的 wrapper：rdi=outWrap, rdx=extObject+0x188, rcx=svrId。
+static int64_t YMRevokeX86LookupWrapper(int64_t a0, int64_t a1, int64_t a2,
+                                        int64_t a3, int64_t a4, int64_t a5) {
+    int64_t result = 0;
+    if (YMRevokeX86RealLookupAddr) {
+        result = ((YMRevokeX86LookupFunc)YMRevokeX86RealLookupAddr)(a0, a1, a2, a3, a4, a5);
+    }
+    static __thread int inWrapper = 0;
+    if (!inWrapper) {
+        inWrapper = 1;
+        @autoreleasepool {
+            try {
+                YMRevokeX86CaptureFromCoReplace((uintptr_t)a0,
+                                                (uintptr_t)a2 - 0x188,
+                                                (uint64_t)a3);
+            } catch (...) {
+                YMLog(@"[X86Callsite] capture exception");
+            }
+        }
+        inWrapper = 0;
+    }
+    return result;
+}
+
+// 把 0x2f93eb1 处 `E8 rel32` 的目标改成 wrapper；rel32 必须 32 位可达。
+static BOOL YMPatchRevokeX86Callsite(uintptr_t slide, uintptr_t callSiteVA) {
+    if (callSiteVA == 0) {
+        return NO;
+    }
+    uintptr_t callAddr = slide + callSiteVA;
+
+    uint8_t opcode = 0;
+    YMSafeReadMemory(callAddr, &opcode, 1);
+    if (opcode != 0xE8) {
+        YMLog(@"[X86Callsite] install failed: not a call(E8) at 0x%lx, op=0x%02x",
+              (unsigned long)callAddr, opcode);
+        return NO;
+    }
+
+    int32_t oldRel = 0;
+    YMSafeReadMemory(callAddr + 1, &oldRel, sizeof(oldRel));
+    YMRevokeX86RealLookupAddr = callAddr + 5 + (intptr_t)oldRel;
+
+    intptr_t newRel = (intptr_t)&YMRevokeX86LookupWrapper - (intptr_t)(callAddr + 5);
+    if (newRel > INT32_MAX || newRel < INT32_MIN) {
+        YMLog(@"[X86Callsite] install failed: wrapper out of rel32 range (newRel=0x%lx)", (unsigned long)newRel);
+        YMRevokeX86RealLookupAddr = 0;
+        return NO;
+    }
+    int32_t rel32 = (int32_t)newRel;
+
+    YMLog(@"[X86Callsite] callAddr=0x%lx realLookup=0x%lx wrapper=0x%lx rel32=0x%x",
+          (unsigned long)callAddr, (unsigned long)YMRevokeX86RealLookupAddr,
+          (unsigned long)&YMRevokeX86LookupWrapper, rel32);
+
+    if (!YMGroupExitWriteCodeBytes(callAddr + 1, (const uint8_t *)&rel32, sizeof(rel32),
+                                   "x86 revoke callsite", "patch call rel32")) {
+        YMRevokeX86RealLookupAddr = 0;
+        return NO;
+    }
+    return YES;
+}
+
 #pragma mark - 安装 Patch
 
 static BOOL YMPatchAntiRevokeWithSlide(intptr_t slide, NSString *source) {
@@ -3307,6 +3448,12 @@ static BOOL YMPatchAntiRevokeWithSlide(intptr_t slide, NSString *source) {
         ok = YMPatchFunctionEntryAbsoluteJump(pointerAddress,
                                               (uintptr_t)&YMRevokeBlockNoticeHandler,
                                               "anti revoke block+notice");
+    } else if (profile->hookMode == YMRevokeHookModeX86Callsite) {
+        /*
+         x86_64：换 CoReplace 里查原消息那条 call 的目标 → wrapper 捕获原文+清替换标志。
+         hookPointerVA 存的是那条 call 指令的 VA(0x2f93eb1)。
+        */
+        ok = YMPatchRevokeX86Callsite((uintptr_t)slide, profile->hookPointerVA);
     } else {
         YMLog(@"unknown revoke hook mode: %d", profile->hookMode);
         ok = NO;
