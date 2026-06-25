@@ -1,5 +1,5 @@
 <p align="center">
-  <img src="./3.png" width="600" alt="SovietExtension Banner" />
+  <img src="./3.1.png" width="900" alt="SovietExtension Banner" />
 </p>
 
 <h1 align="center">SovietExtension 苏维埃助手</h1>

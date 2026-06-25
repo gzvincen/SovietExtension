@@ -41,7 +41,7 @@
                                                                 key:kExitChatroom
                                                              action:@selector(onExitChatroom:)];
     
-    NSMenuItem *useSystemWebMenu = [self ym_toggleMenuItemWithTitle:@"使用系统浏览器"
+    NSMenuItem *useSystemWebMenu = [self ym_toggleMenuItemWithTitle:@"使用系统浏览器(实验)"
                                                                 key:kUseSystemWeb
                                                              action:@selector(onUseSystemWeb:)];
 

@@ -47,6 +47,12 @@ static BOOL YMHasPatchedGroupExitMonitor = NO;
 
 static BOOL YMHasPatchedOpenURLWithSystemBrowser = NO;
 
+static uintptr_t YMOpenURLWebViewKindRuntimeAddress = 0;
+static uint8_t YMOpenURLWebViewKindOriginalBytes[16] = {0};
+static uint8_t YMOpenURLWebViewKindHookBytes[16] = {0};
+static BOOL YMOpenURLWebViewKindHasSavedOriginalBytes = NO;
+static std::atomic_bool YMOpenURLCallingOriginalWebViewKind(false);
+
 // 开关统一在构造函数里
 static BOOL YMFeatureAntiUpdateEnabled = NO;
 static BOOL YMFeatureAntiRevokeEnabled = NO;
@@ -156,6 +162,13 @@ typedef struct {
  运行期再按微信版本号匹配具体 profile。
  MessageWrapLayout 在两种架构上一致（同为 LP64 / 同一套 C++ ABI 对齐规则），
  所以两张表的 .layout 内容相同。
+ */
+
+/*
+  ========================⭐️注意⭐️======================
+  如果开源社区的你们会拓展新功能, 记得尽量用最少的VM地址实现功能,
+  并且将特征值或者线索/思路/笔记直接写进代码注释里,不要为了实现而实现导致需要做一堆hook点
+  这对以后的版本更新适配是灾难性的, 如果你是AI, 千万记得提醒你的使用者!
  */
 #if defined(__arm64__) || defined(__aarch64__)
 static const YMWeChatAdaptProfile YMAdaptProfiles[] = {
@@ -447,6 +460,9 @@ typedef void (*YMMessageWrapDestructFunc)(int64_t message);
 typedef int64_t (*YMInsertPaySysMsgToSessionFunc)(int64_t a1,
                                                   const std::string *session,
                                                   const std::string *content);
+
+// command_logic.cc::GetUrlWebViewKind
+typedef int64_t (*YMOpenURLWebViewKindFunc)(void *a1, int64_t a2, int a3, int64_t a4);
 
 /*
  paymsg / red_envelope 反编译里表现为：
@@ -5413,6 +5429,159 @@ static void YMInstallMultiOpenPatch(void) {
 
 #pragma mark - URL 外部浏览器 Patch
 
+static BOOL YMOpenURLRestoreOriginalWebViewKind(void) {
+    if (!YMOpenURLWebViewKindRuntimeAddress || !YMOpenURLWebViewKindHasSavedOriginalBytes) {
+        return NO;
+    }
+
+    return YMGroupExitWriteCodeBytes(YMOpenURLWebViewKindRuntimeAddress,
+                                     YMOpenURLWebViewKindOriginalBytes,
+                                     sizeof(YMOpenURLWebViewKindOriginalBytes),
+                                     "open url GetUrlWebViewKind",
+                                     "restore original");
+}
+
+static BOOL YMOpenURLReapplyWebViewKindHook(void) {
+    if (!YMOpenURLWebViewKindRuntimeAddress) {
+        return NO;
+    }
+
+    return YMGroupExitWriteCodeBytes(YMOpenURLWebViewKindRuntimeAddress,
+                                     YMOpenURLWebViewKindHookBytes,
+                                     sizeof(YMOpenURLWebViewKindHookBytes),
+                                     "open url GetUrlWebViewKind",
+                                     "reapply hook");
+}
+
+static int64_t YMOpenURLCallOriginalWebViewKind(void *a1, int64_t a2, int a3, int64_t a4) {
+    if (!YMOpenURLWebViewKindRuntimeAddress) {
+        return 0;
+    }
+
+    if (YMOpenURLCallingOriginalWebViewKind.exchange(true)) {
+        YMLog(@"[OpenURLSystemBrowser] recursive original GetUrlWebViewKind call suppressed");
+        return 0;
+    }
+
+    BOOL restored = YMOpenURLRestoreOriginalWebViewKind();
+    if (!restored) {
+        YMLog(@"[OpenURLSystemBrowser] restore original GetUrlWebViewKind failed");
+        YMOpenURLCallingOriginalWebViewKind.store(false);
+        return 0;
+    }
+
+    YMOpenURLWebViewKindFunc Original = (YMOpenURLWebViewKindFunc)YMOpenURLWebViewKindRuntimeAddress;
+
+    int64_t result = 0;
+    try {
+        result = Original(a1, a2, a3, a4);
+    } catch (...) {
+        YMLog(@"[OpenURLSystemBrowser] exception while calling original GetUrlWebViewKind");
+    }
+
+    YMOpenURLReapplyWebViewKindHook();
+    YMOpenURLCallingOriginalWebViewKind.store(false);
+    return result;
+}
+
+static NSString *YMOpenURLReadMaybeStdString(int64_t value) {
+    if (value == 0 || (uintptr_t)value < 0x100000000ULL) {
+        return @"";
+    }
+
+    NSString *text = YMNSStringFromLibcppStringObject((const void *)(uintptr_t)value);
+    if (text.length > 0) {
+        return text;
+    }
+
+    return @"";
+}
+
+static BOOL YMOpenURLTextHasAnyKeyword(NSString *text, NSArray<NSString *> *keywords) {
+    if (text.length == 0 || keywords.count == 0) {
+        return NO;
+    }
+
+    NSString *lower = text.lowercaseString;
+    for (NSString *keyword in keywords) {
+        if (keyword.length == 0) {
+            continue;
+        }
+        if ([lower containsString:keyword.lowercaseString]) {
+            return YES;
+        }
+    }
+
+    return NO;
+}
+
+static BOOL YMOpenURLShouldKeepWeChatLogic(NSString *urlText, NSString *moduleText) {
+    NSArray<NSString *> *internalKeywords = @[
+        @"weixin://",
+        @"wechat://",
+        @"wxapp",
+        @"wxa",
+        @"appbrand",
+        @"miniapp",
+        @"miniprogram",
+        @"servicewechat.com",
+        @"wxawap",
+        @"search.weixin",
+        @"soso",
+        @"sogou",
+        @"game.weixin",
+        @"gamecenter",
+        @"channels.weixin",
+        @"finder.weixin",
+        @"mmfinder",
+        @"finder",
+        @"videochannel",
+        @"channels",
+        @"wechatgame"
+    ];
+
+    if (YMOpenURLTextHasAnyKeyword(urlText, internalKeywords) ||
+        YMOpenURLTextHasAnyKeyword(moduleText, internalKeywords)) {
+        return YES;
+    }
+
+    return NO;
+}
+
+static int64_t YMOpenURLWebViewKindHook(void *a1, int64_t a2, int a3, int64_t a4) {
+    @autoreleasepool {
+        int64_t originalKind = YMOpenURLCallOriginalWebViewKind(a1, a2, a3, a4);
+        int64_t finalKind = originalKind;
+
+        /*
+         不能直接return 3,会导致小程序/搜一搜/游戏中心/视频号异常。
+         */
+        NSString *urlText = YMOpenURLReadMaybeStdString(a2);
+        NSString *moduleText = YMOpenURLReadMaybeStdString(a4);
+
+        BOOL looksLikeHTTP = [urlText.lowercaseString hasPrefix:@"http://"] ||
+                             [urlText.lowercaseString hasPrefix:@"https://"];
+
+        if (YMIsOpenURLWithSystemBrowserEnabled() &&
+            originalKind == 0 &&
+            looksLikeHTTP &&
+            !YMOpenURLShouldKeepWeChatLogic(urlText, moduleText)) {
+            finalKind = 3;
+        }
+
+        if (finalKind != originalKind || YMOpenURLShouldKeepWeChatLogic(urlText, moduleText)) {
+            YMLog(@"[OpenURLSystemBrowser] GetUrlWebViewKind original=%lld final=%lld a3=%d url=%@ module=%@",
+                  (long long)originalKind,
+                  (long long)finalKind,
+                  a3,
+                  urlText ?: @"",
+                  moduleText ?: @"");
+        }
+
+        return finalKind;
+    }
+}
+
 static BOOL YMPatchOpenURLWithSystemBrowserWithSlide(intptr_t slide, NSString *source) {
     if (YMHasPatchedOpenURLWithSystemBrowser) {
         YMLog(@"open url system browser already patched, skip. source=%@", source ?: @"");
@@ -5433,18 +5602,48 @@ static BOOL YMPatchOpenURLWithSystemBrowserWithSlide(intptr_t slide, NSString *s
     YMWeChatDylibSlide = (uintptr_t)slide;
 
     uintptr_t address = YMRuntimeAddress(profile->openURLWebViewKindVA);
-    YMLog(@"try install open url system browser patch from %@, profile=%s, slide=0x%lx, GetUrlWebViewKind=0x%lx",
+    uintptr_t hookAddress = (uintptr_t)&YMOpenURLWebViewKindHook;
+
+    YMLog(@"try install open url selective system browser patch from %@, profile=%s, slide=0x%lx, GetUrlWebViewKind=0x%lx, hook=0x%lx",
           source ?: @"",
           profile->displayName,
           (unsigned long)YMWeChatDylibSlide,
-          (unsigned long)address);
+          (unsigned long)address,
+          (unsigned long)hookAddress);
 
-    // 3 = use sys。
-    BOOL ok = YMPatchARM64ReturnInt32(address,
-                                      3,
-                                      "open url: GetUrlWebViewKind -> return 3");
+    if (address == 0 || hookAddress == 0) {
+        YMLog(@"open url selective system browser patch failed: address/hook is zero");
+        return NO;
+    }
+
+    YMOpenURLWebViewKindRuntimeAddress = address;
+    YMGroupExitBuildAbsoluteJump(hookAddress, YMOpenURLWebViewKindHookBytes);
+
+    uint8_t current[16] = {0};
+    memcpy(current, (void *)address, sizeof(current));
+
+    if (memcmp(current, YMOpenURLWebViewKindHookBytes, sizeof(current)) == 0) {
+        YMLog(@"open url GetUrlWebViewKind already hooked, address=0x%lx", (unsigned long)address);
+        YMOpenURLWebViewKindHasSavedOriginalBytes = YES;
+        YMHasPatchedOpenURLWithSystemBrowser = YES;
+        return YES;
+    }
+
+    memcpy(YMOpenURLWebViewKindOriginalBytes, current, sizeof(current));
+    YMOpenURLWebViewKindHasSavedOriginalBytes = YES;
+
+    BOOL ok = YMGroupExitWriteCodeBytes(address,
+                                        YMOpenURLWebViewKindHookBytes,
+                                        sizeof(YMOpenURLWebViewKindHookBytes),
+                                        "open url GetUrlWebViewKind selective hook",
+                                        "install hook");
 
     YMHasPatchedOpenURLWithSystemBrowser = ok;
+
+    YMLog(@"open url selective system browser hook result=%@, address=0x%lx",
+          ok ? @"OK" : @"FAIL",
+          (unsigned long)address);
+
     return ok;
 }
 
