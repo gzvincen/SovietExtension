@@ -11,6 +11,7 @@
 #import "AntiUpdate.h"
 #import <Foundation/Foundation.h>
 #import <mach/mach.h>
+#import <mach/mach_vm.h>
 #import <mach-o/dyld.h>
 #import <libkern/OSCacheControl.h>
 #import <unistd.h>
@@ -21,6 +22,7 @@
 #import <objc/message.h>
 #import "MenuManager.h"
 #import "NSObject+MainHook.h"
+#import "AutoLogin.h"
 
 #include <string>
 #include <vector>
@@ -59,6 +61,7 @@ static void YMRegisterDyldCallbackIfNeeded(void);
 static void YMInstallMultiOpenPatch(void);
 static void YMInstallGroupExitMonitorPatch(void);
 static void YMInstallOpenURLWithSystemBrowserPatch(void);
+static void YMInstallRevokeDiag(void);  // 收消息函数追踪诊断（x86_64；arm64 为 no-op）
 
 typedef enum {
     YMRevokeHookModePointer = 0,   // 4.1.9：写 off_91EAD20
@@ -135,8 +138,13 @@ typedef struct {
 
     uintptr_t openURLWebViewKindVA;
 
+    // 表情包信息源：收/构造消息的函数入口 VA（entry detour 观察每条消息的 MessageWrap）。
+    // 0 = 未逆向，安装时安全跳过（不会崩）。需用 lldb 在目标版本上确认真实入口后填入。
+    // 候选(WeChatIntercept 笔记, x86_64 4.1.x)：0x4ecbb60（CMessageWrap 路径, msg 在 rsi/a1）。
+    uintptr_t emojiMsgHandlerVA;
+
     YMMessageWrapLayout layout;
-    
+
     YMRevokeHookMode hookMode;//4.1.10添加
 } YMWeChatAdaptProfile;
 
@@ -194,6 +202,8 @@ static const YMWeChatAdaptProfile YMAdaptProfiles[] = {
 
         .openURLWebViewKindVA = 0,
 
+        .emojiMsgHandlerVA = 0,
+
         .layout = {
             .messageWrapSize = 616,
 
@@ -206,7 +216,7 @@ static const YMWeChatAdaptProfile YMAdaptProfiles[] = {
             .contentOffset = 328,
         },
     },
-    
+
     {
         .displayName = "Mac WeChat 4.1.10.53 arm64 / 268853",
 
@@ -270,6 +280,12 @@ static const YMWeChatAdaptProfile YMAdaptProfiles[] = {
 
         .openURLWebViewKindVA = 0x1C7C6AC, //->Lhook->GetUrlWebViewKind
 
+        // 表情包信息源：收/构造消息函数真实体 = 0x482F550（原始消息在 x1/a1）。
+        //   静态在本 build(268853) arm64 切片确认：messageWrapFromRaw 文档地址 0x482F54C
+        //   是 `b 0x482e0e0` thunk，真实体在 +4：stp..;mov x19,x1;bl;ldr x8,[x19+0x70];
+        //   str x8,[x0+0x100]，与 x86 0x4ecc910 同构。
+        .emojiMsgHandlerVA = 0x482F550,
+
         .layout = {
             .messageWrapSize = 616,
 
@@ -312,6 +328,7 @@ static const YMWeChatAdaptProfile YMAdaptProfiles[] = {
          .revokeOriginCallsiteZeroBranchVA = 新版 CBZ 分支地址，没有就填 0,
          .revokeDeleteMessagesVA = 新版 DeleteMessages 函数入口地址，没有就填 0,
          .openURLWebViewKindVA = 新版 GetUrlWebViewKind 函数入口地址，没有就填 0,
+         .emojiMsgHandlerVA = 新版收消息函数入口地址(表情包信息源用)，没有就填 0,
 
          .layout = {
              .messageWrapSize = 616,
@@ -389,6 +406,13 @@ static const YMWeChatAdaptProfile YMAdaptProfiles[] = {
         .revokeOriginCallsiteContinueVA = 0,
         .revokeOriginCallsiteZeroBranchVA = 0,
         .revokeDeleteMessagesVA = 0,
+
+        // 表情包信息源：收/构造消息函数入口 = messageWrapFromRaw 真实体 0x4ecc910。
+        //   静态在本 build(268853) x86_64 切片唯一命中 WeChatIntercept 文档签名：
+        //   push rbp;mov rbp,rsp;push r14;push rbx;mov rbx,rsi;mov r14,rdi;call;
+        //   mov rax,[rbx+0x70];mov [r14+0x100],rax —— 原始消息在 rsi(=a1)。
+        //   (0x4ecc900 是跳到 helper 0x4ecb150 的 thunk，非本函数。)
+        .emojiMsgHandlerVA = 0x4ecc910,
 
         // 布局与 arm64 一致（LP64 同一套 C++ ABI），运行期日志再二次确认。
         .layout = {
@@ -4242,6 +4266,870 @@ static BOOL YMPatchRevokeX86Callsite(uintptr_t slide, uintptr_t callSiteVA) {
     return YES;
 }
 
+#pragma mark - 表情包信息源（emoji-only message source）
+
+/*
+ 目标（用户限定范围）：只捕获“表情包(emoji)”消息，其它消息类型一律忽略。
+ 捕获内容：表情的 cdnurl / thumburl / externurl / aeskey / md5 等可下载/可识别字段，
+ 以及时间、会话、发送者；以卡片形式滚动写入 /tmp/wechat_emoji_source.html，菜单里可打开查看。
+
+ 机制（关键：热路径，必须零 per-call 开销）：一次性 inline hook + trampoline。
+ 入口只打一次绝对跳转到 hook；hook 抽完字段后调用 trampoline（=被覆盖的原 prologue
+ + 跳回原函数体续跑）放行。**不做** per-call 的 vm_protect/还原-重挂/icache（那是上一版
+ 卡顿根因：messageWrapFromRaw 每条消息都调，渲染列表时被狂调）。
+ 入口被覆盖的字节恰好是位置无关 prologue（x86 13B / arm64 16B），不切割位置相关指令，
+ 故 trampoline 无需重定位、续跑点是合法指令边界。
+
+ 常驻安装（无开关）：注入即装，像 WeChatIntercept 的监听守护一样一直抓。
+ ⚠️ emojiMsgHandlerVA=0 时安全跳过，绝不崩。
+*/
+
+static NSString * const kYMEmojiSourceHTMLPath = @"/tmp/wechat_emoji_source.html";
+static NSString * const kYMEmojiSourceStorePath = @"/tmp/wechat_emoji_source.plist";
+static const NSTimeInterval kYMEmojiRetentionSeconds = 7 * 24 * 60 * 60;  // 保留 7 天
+
+static uintptr_t YMEmojiMsgHandlerRuntimeAddress = 0;   // 原函数入口（已被打补丁）
+static uintptr_t YMEmojiTrampoline = 0;                 // 执行原 prologue+续跑的跳板
+
+typedef int64_t (*YMEmojiMsgHandlerFunc)(int64_t a0, int64_t a1, int64_t a2,
+                                         int64_t a3, int64_t a4, int64_t a5);
+
+// 在 wrap 的若干候选偏移里找一段含 <emoji 的 XML / content。找不到返回 nil（非表情，忽略）。
+static NSString *YMEmojiFindEmojiXMLFromWrap(void *wrap, size_t wrapSize) {
+    if (!wrap || wrapSize < 24) {
+        return nil;
+    }
+    // 收消息热路径：先查内容串常见落点，命中即返回（快）。
+    const size_t preferredOffsets[] = {328, 304, 352, 376, 400, 424, 280, 248, 224, 200,
+                                       112, 88, 64, 40, 0x70};
+    for (size_t i = 0; i < sizeof(preferredOffsets) / sizeof(preferredOffsets[0]); i++) {
+        size_t offset = preferredOffsets[i];
+        if (offset + 24 > wrapSize) {
+            continue;
+        }
+        NSString *value = YMNSStringFromLibcppStringObject((uint8_t *)wrap + offset);
+        if (value.length && [value.lowercaseString containsString:@"<emoji"]) {
+            return value;
+        }
+    }
+    // 热路径：不做逐 8 字节全扫（会拖慢渲染）。常见偏移覆盖实测落点；若实测某偏移没覆盖
+    // 到表情 XML，再把该偏移加进上面的 preferredOffsets。
+    return nil;
+}
+
+// 取 XML 里某个属性值：attr="...."（不区分大小写）。
+static NSString *YMEmojiAttr(NSString *xml, NSString *attr) {
+    if (xml.length == 0 || attr.length == 0) {
+        return @"";
+    }
+    NSString *needle = [NSString stringWithFormat:@"%@=\"", attr];
+    NSRange a = [xml rangeOfString:needle options:NSCaseInsensitiveSearch];
+    if (a.location == NSNotFound) {
+        return @"";
+    }
+    NSUInteger start = NSMaxRange(a);
+    NSRange rest = NSMakeRange(start, xml.length - start);
+    NSRange b = [xml rangeOfString:@"\"" options:0 range:rest];
+    if (b.location == NSNotFound) {
+        return @"";
+    }
+    return [xml substringWithRange:NSMakeRange(start, b.location - start)];
+}
+
+static NSString *YMHTMLEscape(NSString *s) {
+    if (s.length == 0) {
+        return @"";
+    }
+    NSMutableString *m = [s mutableCopy];
+    [m replaceOccurrencesOfString:@"&" withString:@"&amp;" options:0 range:NSMakeRange(0, m.length)];
+    [m replaceOccurrencesOfString:@"<" withString:@"&lt;" options:0 range:NSMakeRange(0, m.length)];
+    [m replaceOccurrencesOfString:@">" withString:@"&gt;" options:0 range:NSMakeRange(0, m.length)];
+    return m;
+}
+
+// 追加一条表情记录：按 dedupeKey(md5) 去重、落盘持久化(跨重启)、保留 7 天、
+// 重生成每 3 秒自刷新的 HTML。记录存为 plist 数组 [{ts, html, key}]，串行队列保证一致。
+static void YMEmojiAppendCard(NSString *cardHTML, NSString *dedupeKey) {
+    static dispatch_queue_t q;
+    static dispatch_once_t once;
+    static NSMutableArray<NSDictionary *> *records = nil;
+    static NSMutableSet<NSString *> *seenKeys = nil;
+    dispatch_once(&once, ^{
+        q = dispatch_queue_create("ym.emoji.source", DISPATCH_QUEUE_SERIAL);
+        NSArray *loaded = [NSArray arrayWithContentsOfFile:kYMEmojiSourceStorePath];
+        records = loaded ? [loaded mutableCopy] : [NSMutableArray array];
+        seenKeys = [NSMutableSet set];
+        for (NSDictionary *r in records) {
+            NSString *k = r[@"key"];
+            if (k.length) { [seenKeys addObject:k]; }
+        }
+    });
+    dispatch_async(q, ^{
+        @autoreleasepool {
+            NSString *key = dedupeKey.length ? dedupeKey : cardHTML;
+            if ([seenKeys containsObject:key]) {
+                return;   // 同一张表情(同 md5)已记录过，跳过
+            }
+            [seenKeys addObject:key];
+
+            NSTimeInterval now = [[NSDate date] timeIntervalSince1970];
+            [records addObject:@{ @"ts": @(now), @"html": cardHTML ?: @"", @"key": key }];
+
+            // 丢弃 7 天前的记录
+            NSTimeInterval cutoff = now - kYMEmojiRetentionSeconds;
+            NSUInteger drop = 0;
+            for (NSDictionary *r in records) {
+                if ([r[@"ts"] doubleValue] < cutoff) { drop++; } else { break; }
+            }
+            if (drop > 0) {
+                [records removeObjectsInRange:NSMakeRange(0, drop)];
+            }
+
+            [records writeToFile:kYMEmojiSourceStorePath atomically:YES];
+
+            NSMutableString *html = [NSMutableString string];
+            [html appendString:@"<!doctype html><meta charset=utf-8>"
+                               @"<meta http-equiv=refresh content=3>"
+                               @"<body style='font-family:-apple-system;background:#f5f5f7;"
+                               @"margin:0;padding:20px;color:#1d1d1f'>"];
+            [html appendFormat:@"<h2>表情包信息源（保留7天，最近在上，共%lu条）</h2>",
+                               (unsigned long)records.count];
+            for (NSDictionary *r in [records reverseObjectEnumerator]) {
+                [html appendString:r[@"html"] ?: @""];
+            }
+            [html appendString:@"</body>"];
+            [html writeToFile:kYMEmojiSourceHTMLPath atomically:YES
+                     encoding:NSUTF8StringEncoding error:nil];
+        }
+    });
+}
+
+// 给定一个候选 wrap 指针，若它是表情消息则抽字段写卡片，返回是否命中表情。
+static BOOL YMEmojiCaptureFromWrap(void *wrap) {
+    const YMWeChatAdaptProfile *profile = YMGetActiveProfile();
+    if (!profile || !wrap) {
+        return NO;
+    }
+    size_t wrapSize = profile->layout.messageWrapSize;
+
+    NSString *xml = YMEmojiFindEmojiXMLFromWrap(wrap, wrapSize);
+    if (xml.length == 0) {
+        return NO;   // 非表情 → 忽略
+    }
+
+    NSString *cdnurl    = YMEmojiAttr(xml, @"cdnurl");
+    NSString *thumburl  = YMEmojiAttr(xml, @"thumburl");
+    NSString *externurl = YMEmojiAttr(xml, @"externurl");
+    NSString *encrypturl = YMEmojiAttr(xml, @"encrypturl");
+    NSString *aeskey    = YMEmojiAttr(xml, @"aeskey");
+    NSString *md5       = YMEmojiAttr(xml, @"md5");
+    NSString *width     = YMEmojiAttr(xml, @"width");
+    NSString *height    = YMEmojiAttr(xml, @"height");
+
+    NSString *session = YMNSStringFromLibcppStringObject(
+        (uint8_t *)wrap + profile->layout.remoteUserOrSessionOffset);
+    uint32_t timeSec = YMRawWrapUInt32Field(wrap, profile->layout.createTimeSecOffset);
+    uint64_t timeMs  = YMRawWrapUInt64Field(wrap, profile->layout.createTimeMsOffset);
+    NSString *timeText = YMFormatTimestamp(timeSec, timeMs);
+
+    NSString *primaryURL = cdnurl.length ? cdnurl
+                          : (thumburl.length ? thumburl
+                          : (externurl.length ? externurl : @""));
+
+    YMLog(@"[EmojiSource] emoji captured session=%@ cdnurl=%@", session, primaryURL);
+
+    NSMutableString *card = [NSMutableString string];
+    [card appendString:@"<div style='background:#fff;border-radius:12px;padding:16px;"
+                       @"margin:0 0 14px;box-shadow:0 1px 3px rgba(0,0,0,.08)'>"];
+    [card appendFormat:@"<div style='color:#86868b;font-size:12px'>%@ · %@</div>",
+                       YMHTMLEscape(timeText), YMHTMLEscape(session)];
+    if (primaryURL.length) {
+        [card appendFormat:@"<div style='margin:8px 0'><img src='%@' "
+                           @"style='max-height:120px;border-radius:8px'></div>",
+                           YMHTMLEscape(primaryURL)];
+    }
+    void (^row)(NSString *, NSString *) = ^(NSString *k, NSString *v) {
+        if (v.length == 0) { return; }
+        [card appendFormat:@"<div style='font-size:12px;margin:2px 0'>"
+                           @"<b>%@</b>: <code style='word-break:break-all'>%@</code></div>",
+                           k, YMHTMLEscape(v)];
+    };
+    row(@"cdnurl", cdnurl);
+    row(@"thumburl", thumburl);
+    row(@"externurl", externurl);
+    row(@"encrypturl", encrypturl);
+    row(@"aeskey", aeskey);
+    row(@"md5", md5);
+    if (width.length || height.length) {
+        row(@"size", [NSString stringWithFormat:@"%@ x %@", width, height]);
+    }
+    [card appendFormat:@"<details style='margin-top:6px'><summary style='font-size:12px;"
+                       @"color:#86868b'>raw xml</summary><pre style='font-size:11px;"
+                       @"white-space:pre-wrap;word-break:break-all'>%@</pre></details>",
+                       YMHTMLEscape(xml)];
+    [card appendString:@"</div>"];
+
+    YMEmojiAppendCard(card, md5.length ? md5 : primaryURL);
+    return YES;
+}
+
+#pragma mark - 表情包信息源：进程内内存扫描（只读 vm_read，不 hook、不改字节、不会崩）
+
+/*
+ 方案确定（实机 lldb 内存扫描已验证可行）：表情消息收到后，其 <emoji ... cdnurl=...>
+ XML 一直存在于本进程堆内存里。插件就跑在微信进程内，直接 vm_read 扫自己进程的可写堆，
+ memmem 找 "<emoji" → 抽 cdnurl/md5 等 → 按 md5 去重 → 写 7 天 HTML。
+ 全程只读，不 hook 任何函数、不改任何字节，不依赖微信版本/地址，绝不崩。
+*/
+
+// 从一段以 "<emoji" 开头的内存里截出完整 <emoji ...> 开标签。
+static NSString *YMEmojiTagFromBuffer(const char *buf, size_t len, size_t start) {
+    size_t end = start;
+    while (end < len && buf[end] != '>') {
+        end++;
+    }
+    if (end >= len || end <= start) {
+        return nil;   // 标签被缓冲边界截断，跳过（重叠扫描下次会补上）
+    }
+    return [[NSString alloc] initWithBytes:(buf + start)
+                                    length:(end - start + 1)
+                                  encoding:NSUTF8StringEncoding];
+}
+
+// XML 实体反转义（cdnurl 在 XML 里是 &amp; 形式，下载/显示要还原）。
+static NSString *YMEmojiUnescape(NSString *s) {
+    if (s.length == 0) {
+        return s ?: @"";
+    }
+    NSMutableString *m = [s mutableCopy];
+    [m replaceOccurrencesOfString:@"&amp;" withString:@"&" options:0 range:NSMakeRange(0, m.length)];
+    [m replaceOccurrencesOfString:@"&lt;" withString:@"<" options:0 range:NSMakeRange(0, m.length)];
+    [m replaceOccurrencesOfString:@"&gt;" withString:@">" options:0 range:NSMakeRange(0, m.length)];
+    [m replaceOccurrencesOfString:@"&quot;" withString:@"\"" options:0 range:NSMakeRange(0, m.length)];
+    return m;
+}
+
+// ── 记录存储（结构化，按会话分组）─────────────────────────────
+static dispatch_queue_t g_ymEmojiQueue = nil;
+static NSMutableArray<NSMutableDictionary *> *g_ymEmojiRecords = nil;
+static NSMutableSet<NSString *> *g_ymEmojiSeen = nil;
+
+static void YMEmojiStoreInit(void) {
+    static dispatch_once_t once;
+    dispatch_once(&once, ^{
+        g_ymEmojiQueue = dispatch_queue_create("ym.emoji.src", DISPATCH_QUEUE_SERIAL);
+        g_ymEmojiRecords = [NSMutableArray array];
+        g_ymEmojiSeen = [NSMutableSet set];
+        NSArray *loaded = [NSArray arrayWithContentsOfFile:kYMEmojiSourceStorePath];
+        NSTimeInterval cut = [[NSDate date] timeIntervalSince1970] - kYMEmojiRetentionSeconds;
+        for (NSDictionary *r in loaded) {
+            if ([r[@"t"] doubleValue] < cut) { continue; }
+            [g_ymEmojiRecords addObject:[r mutableCopy]];
+            NSString *k = r[@"md5"];
+            if (k.length) { [g_ymEmojiSeen addObject:k]; }
+        }
+    });
+}
+
+// WeChatIntercept 原版页面样式（按用户/群分两列、可折叠、点击下载 .gif）。
+static NSString * const kYMEmojiCSS = @"<style>"
+    "body{font-family:-apple-system,Helvetica,Arial,sans-serif;background:#f0f2f5;margin:0;padding:14px;}"
+    "h1{font-size:15px;color:#555;margin:4px 0 12px;}"
+    ".cols{display:flex;gap:14px;align-items:flex-start;}"
+    ".col{flex:1;min-width:0;}"
+    ".colh{position:sticky;top:0;font-size:13px;font-weight:600;color:#fff;padding:6px 10px;border-radius:8px;margin-bottom:6px;}"
+    ".colh.priv{background:#3498db;}.colh.grp{background:#e67e22;}"
+    ".empty{color:#bbb;font-size:13px;padding:10px;}"
+    ".conv{background:#fff;border-radius:10px;margin:8px 0;padding:4px 10px 8px;box-shadow:0 1px 4px rgba(0,0,0,.08);}"
+    ".conv>summary{cursor:pointer;font-weight:600;color:#222;padding:6px 2px;font-size:14px;list-style:none;}"
+    ".top{position:sticky;top:0;z-index:5;background:#07c160;color:#fff;padding:10px 16px;border-radius:0 0 12px 12px;box-shadow:0 2px 8px rgba(0,0,0,.12);margin:-14px -14px 12px;}"
+    ".top h1{margin:0;font-size:17px;color:#fff;}.sub{font-size:12px;opacity:.9;margin-top:2px;}"
+    "summary{display:flex;align-items:center;gap:8px;}summary::-webkit-details-marker{display:none;}"
+    "summary::before{content:'\\25B8';color:#bbb;transition:.15s;}details[open]>summary::before{transform:rotate(90deg);}"
+    ".cn{font-weight:600;color:#222;font-size:14px;flex:1;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;}"
+    ".cmeta{color:#9aa0a6;font-size:12px;font-weight:400;}"
+    ".grid{display:flex;flex-wrap:wrap;gap:8px;padding:4px 0 2px;}"
+    ".it{display:flex;flex-direction:column;align-items:center;}"
+    ".ph{display:block;border-radius:8px;overflow:hidden;border:1px solid #eee;background:#fff;transition:.15s;cursor:pointer;}"
+    ".ph:hover{transform:scale(1.04);box-shadow:0 3px 10px rgba(0,0,0,.15);}"
+    ".ph img{max-height:104px;max-width:130px;display:block;}"
+    ".cap{font-size:10px;color:#9aa0a6;margin-top:3px;text-align:center;max-width:130px;}.cap b{color:#e67e22;font-weight:600;}"
+    ".bar{display:flex;align-items:center;gap:8px;margin-top:7px;}"
+    ".rb{background:rgba(255,255,255,.25);color:#fff;border:0;border-radius:6px;padding:4px 11px;font-size:12px;cursor:pointer;}"
+    ".rb:hover{background:rgba(255,255,255,.42);}"
+    ".rl{font-size:12px;opacity:.9;}"
+    ".rs{font-size:12px;border-radius:6px;border:0;padding:3px 6px;background:#fff;color:#222;cursor:pointer;}"
+    ".rc{font-size:12px;opacity:.85;min-width:42px;}"
+    "a{color:#2d6cdf;}</style>";
+
+static NSString * const kYMEmojiJS = @"<script>"
+    "function dl(u,n){try{fetch(u).then(function(r){return r.blob()}).then(function(b){"
+    "var a=document.createElement('a');a.href=URL.createObjectURL(b);a.download=n;"
+    "document.body.appendChild(a);a.click();a.remove();"
+    "setTimeout(function(){URL.revokeObjectURL(a.href)},2000);}).catch(function(){window.open(u)})}"
+    "catch(e){window.open(u)}return false;}"
+    // 刷新控制：手动(关) / 选间隔自动刷新，选择记 localStorage，带倒计时。
+    "var RK='wxri';function setRi(v){localStorage.setItem(RK,v);applyRi();}"
+    "function applyRi(){var v=localStorage.getItem(RK);if(v===null)v='5';"
+    "var sel=document.getElementById('ri');if(sel)sel.value=v;"
+    "if(window._t)clearInterval(window._t);var n=+v;var rc=document.getElementById('rc');"
+    "if(n>0){var left=n;if(rc)rc.textContent='('+left+'s)';"
+    "window._t=setInterval(function(){left--;if(rc)rc.textContent='('+left+'s)';"
+    "if(left<=0){location.reload();}},1000);}else if(rc){rc.textContent='手动';}}"
+    "var K='wxsrc';function S(){try{return JSON.parse(localStorage.getItem(K)||'{}')}catch(e){return{}}}"
+    "addEventListener('DOMContentLoaded',function(){var s=S();"
+    "document.querySelectorAll('details[data-k]').forEach(function(d){"
+    "if(d.dataset.k in s){d.open=s[d.dataset.k];}"
+    "d.addEventListener('toggle',function(){var o=S();o[d.dataset.k]=d.open;localStorage.setItem(K,JSON.stringify(o));});});"
+    "var y=sessionStorage.wxy;if(y)scrollTo(0,+y);"
+    "addEventListener('scroll',function(){sessionStorage.wxy=scrollY;});applyRi();});</script>";
+
+static NSString *YMEmojiTsShort(NSString *ts) {
+    // "yyyy-MM-dd HH:mm:ss" → "MM-dd HH:mm"
+    if (ts.length >= 16) {
+        return [ts substringWithRange:NSMakeRange(5, 11)];
+    }
+    return ts ?: @"";
+}
+
+// 单个会话 → <details> 折叠块 + 表情网格。
+static NSString *YMEmojiConvHTML(NSArray<NSDictionary *> *items) {
+    NSArray *its = [items sortedArrayUsingComparator:^NSComparisonResult(NSDictionary *a, NSDictionary *b) {
+        return [b[@"t"] compare:a[@"t"]];
+    }];
+    NSMutableString *cells = [NSMutableString string];
+    NSUInteger n = 0;
+    for (NSDictionary *r in its) {
+        if (n++ >= 120) { break; }
+        NSString *u = r[@"url"];
+        NSString *nm = YMHTMLEscape(r[@"name"]);
+        NSString *media = [NSString stringWithFormat:
+            @"<a class=\"ph\" href=\"%@\" title=\"点击下载.gif / 右键存图\" "
+            @"onclick=\"return dl('%@','%@')\"><img src=\"%@\" loading=\"lazy\" "
+            @"onerror=\"this.style.display='none'\"></a>", u, u, nm, u];
+        NSString *by = ([r[@"group"] boolValue] && [r[@"nick"] length])
+            ? [NSString stringWithFormat:@"<b>%@</b> ", YMHTMLEscape(r[@"nick"])] : @"";
+        [cells appendFormat:@"<div class=\"it\">%@<div class=\"cap\">%@%@</div></div>",
+                            media, by, YMHTMLEscape(YMEmojiTsShort(r[@"ts"]))];
+    }
+    NSDictionary *first = its.firstObject;
+    return [NSString stringWithFormat:
+        @"<details class=\"conv\" data-k=\"%@\" open><summary><span class=\"cn\">%@</span>"
+        @"<span class=\"cmeta\">%lu · %@</span></summary><div class=\"grid\">%@</div></details>",
+        YMHTMLEscape(first[@"ckey"]), YMHTMLEscape(first[@"clabel"]),
+        (unsigned long)its.count, YMHTMLEscape(YMEmojiTsShort(first[@"ts"])), cells];
+}
+
+// 重生成整页 HTML（在串行队列上调用）。
+static void YMEmojiWriteHTMLLocked(void) {
+    NSMutableDictionary<NSString *, NSMutableArray *> *convs = [NSMutableDictionary dictionary];
+    for (NSDictionary *r in g_ymEmojiRecords) {
+        NSString *ck = r[@"ckey"] ?: @"未知";
+        NSMutableArray *arr = convs[ck];
+        if (!arr) { arr = [NSMutableArray array]; convs[ck] = arr; }
+        [arr addObject:r];
+    }
+    NSMutableArray *privs = [NSMutableArray array];
+    NSMutableArray *grps = [NSMutableArray array];
+    for (NSArray *v in convs.allValues) {
+        if ([v.firstObject[@"group"] boolValue]) { [grps addObject:v]; }
+        else { [privs addObject:v]; }
+    }
+    NSComparator latest = ^NSComparisonResult(NSArray *a, NSArray *b) {
+        double ta = 0, tb = 0;
+        for (NSDictionary *r in a) { ta = MAX(ta, [r[@"t"] doubleValue]); }
+        for (NSDictionary *r in b) { tb = MAX(tb, [r[@"t"] doubleValue]); }
+        return tb > ta ? NSOrderedDescending : (tb < ta ? NSOrderedAscending : NSOrderedSame);
+    };
+    [privs sortUsingComparator:latest];
+    [grps sortUsingComparator:latest];
+
+    NSMutableString *privHTML = [NSMutableString string];
+    for (NSArray *v in privs) { [privHTML appendString:YMEmojiConvHTML(v)]; }
+    NSMutableString *grpHTML = [NSMutableString string];
+    for (NSArray *v in grps) { [grpHTML appendString:YMEmojiConvHTML(v)]; }
+    if (privHTML.length == 0) { [privHTML appendString:@"<div class=\"empty\">暂无</div>"]; }
+    if (grpHTML.length == 0) { [grpHTML appendString:@"<div class=\"empty\">暂无</div>"]; }
+
+    NSMutableString *html = [NSMutableString string];
+    [html appendString:@"<!doctype html><html><head><meta charset=\"utf-8\"><title>微信表情源</title>"];
+    [html appendString:kYMEmojiCSS];
+    [html appendString:@"</head><body>"];
+    [html appendFormat:@"<div class=\"top\"><h1>📨 微信表情源</h1>"
+                       @"<div class=\"sub\">表情/动图GIF · 保留7天 · 共 %lu 条</div>"
+                       @"<div class=\"bar\"><button class=\"rb\" onclick=\"location.reload()\">↻ 手动刷新</button>"
+                       @"<span class=\"rl\">自动刷新</span>"
+                       @"<select id=\"ri\" class=\"rs\" onchange=\"setRi(this.value)\">"
+                       @"<option value=\"0\">关</option><option value=\"3\">3秒</option>"
+                       @"<option value=\"5\">5秒</option><option value=\"10\">10秒</option>"
+                       @"<option value=\"30\">30秒</option><option value=\"60\">60秒</option></select>"
+                       @"<span id=\"rc\" class=\"rc\"></span></div></div>",
+                       (unsigned long)g_ymEmojiRecords.count];
+    [html appendString:@"<div class=\"cols\">"];
+    [html appendFormat:@"<div class=\"col\"><div class=\"colh priv\">👤 私聊 · %lu</div>%@</div>",
+                       (unsigned long)privs.count, privHTML];
+    [html appendFormat:@"<div class=\"col\"><div class=\"colh grp\">👥 群聊 · %lu</div>%@</div>",
+                       (unsigned long)grps.count, grpHTML];
+    [html appendString:@"</div>"];
+    [html appendString:kYMEmojiJS];
+    [html appendString:@"</body></html>"];
+
+    [html writeToFile:kYMEmojiSourceHTMLPath atomically:YES encoding:NSUTF8StringEncoding error:nil];
+}
+
+// url 是否"形态完整、能从 CDN 加载"。内存里有干净副本和残缺副本（渲染缓存），
+// 残缺副本缺 & 分隔或带 &amp; → CDN 返回 400 → 图加载不出来。只收干净的。
+static BOOL YMEmojiURLLoadable(NSString *u) {
+    if (u.length < 16 || ![u hasPrefix:@"http"]) {
+        return NO;
+    }
+    if ([u containsString:@"&amp;"]) {
+        return NO;   // 没正确反转义
+    }
+    if ([u containsString:@"filekey="]) {
+        // stodownload 型必须带正确的 & 分隔尾参，否则是残缺副本（参数被粘连）。
+        if (![u containsString:@"&hy="] && ![u containsString:@"&bizid="] &&
+            ![u containsString:@"&storeid="]) {
+            return NO;
+        }
+    }
+    return YES;
+}
+
+// 选一个"能加载"的 url（优先 cdnurl→thumburl→externurl），都不行返回 nil。
+static NSString *YMEmojiPickLoadableURL(NSString *tag) {
+    NSArray<NSString *> *keys = @[@"cdnurl", @"thumburl", @"externurl"];
+    for (NSString *k in keys) {
+        NSString *u = YMEmojiUnescape(YMEmojiAttr(tag, k));
+        if (YMEmojiURLLoadable(u)) {
+            return u;
+        }
+    }
+    return nil;
+}
+
+// ── 昵称/群名解析（内存探针：找 id 联系人对象的相邻"名字"字段）──────────────
+static NSMutableSet<NSString *> *g_ymNameTried = nil;
+
+static BOOL YMLooksLikeName(NSString *s) {
+    if (s.length < 2 || s.length > 32) {
+        return NO;
+    }
+    if ([s hasPrefix:@"wxid_"] || [s hasPrefix:@"http"]) {
+        return NO;
+    }
+    if ([s rangeOfCharacterFromSet:
+            [NSCharacterSet characterSetWithCharactersInString:@"<>=/\\\"{}@&%?:;.,"]].location != NSNotFound) {
+        return NO;
+    }
+    BOOL hasCJK = NO, hasDigit = NO, hasLetter = NO;
+    for (NSUInteger i = 0; i < s.length; i++) {
+        unichar c = [s characterAtIndex:i];
+        if (c < 0x20) {
+            return NO;   // 控制字符 → 不是名字
+        } else if (c >= 0x4E00 && c <= 0x9FFF) {
+            hasCJK = YES;
+        } else if (c >= '0' && c <= '9') {
+            hasDigit = YES;
+        } else if ((c >= 'A' && c <= 'Z') || (c >= 'a' && c <= 'z')) {
+            hasLetter = YES;
+        }
+    }
+    // 接受：含中文(昵称多为中文)；或 纯字母无数字且≥4(英文名)。排除 "Y"/"a21" 这类。
+    if (hasCJK) {
+        return YES;
+    }
+    if (hasLetter && !hasDigit && s.length >= 4) {
+        return YES;
+    }
+    return NO;
+}
+
+// 在内存里探测 idStr(wxid/roomid) 对应的昵称/群名；找不到返回 nil。
+static NSString *YMProbeName(NSString *idStr) {
+    const char *needle = [idStr UTF8String];
+    if (!needle) {
+        return nil;
+    }
+    size_t nlen = strlen(needle);
+    if (nlen == 0 || nlen > 64) {
+        return nil;
+    }
+    mach_port_t task = mach_task_self();
+    mach_vm_address_t addr = 0;
+    const size_t CHUNK = 4 * 1024 * 1024;
+    char *buf = (char *)malloc(CHUNK);
+    if (!buf) {
+        return nil;
+    }
+    uint64_t scanned = 0;
+    const uint64_t BUDGET = 2200ULL * 1024 * 1024;
+    // 频次统计：相邻的"像名字"候选出现次数。真昵称(联系人对象+各处引用)会反复出现，
+    // 随机垃圾只出现一两次。最后取出现最多且达阈值的。
+    NSMutableDictionary<NSString *, NSNumber *> *counts = [NSMutableDictionary dictionary];
+
+    while (scanned < BUDGET) {
+        mach_vm_size_t size = 0;
+        vm_region_basic_info_data_64_t info;
+        mach_msg_type_number_t cnt = VM_REGION_BASIC_INFO_COUNT_64;
+        mach_port_t objName = MACH_PORT_NULL;
+        if (mach_vm_region(task, &addr, &size, VM_REGION_BASIC_INFO_64,
+                           (vm_region_info_t)&info, &cnt, &objName) != KERN_SUCCESS) {
+            break;
+        }
+        mach_vm_address_t rs = addr, re = addr + size;
+        addr = re;
+        if (!((info.protection & VM_PROT_READ) && (info.protection & VM_PROT_WRITE)) ||
+            size == 0 || size > 96 * 1024 * 1024) {
+            continue;
+        }
+        mach_vm_address_t off = rs;
+        while (off < re) {
+            size_t want = (size_t)MIN((mach_vm_address_t)CHUNK, re - off);
+            mach_vm_size_t got = 0;
+            if (mach_vm_read_overwrite(task, off, want, (mach_vm_address_t)buf, &got) != KERN_SUCCESS || got == 0) {
+                break;
+            }
+            scanned += got;
+            size_t pos = 0;
+            while (pos + nlen <= (size_t)got) {
+                void *hit = memmem(buf + pos, (size_t)got - pos, needle, nlen);
+                if (!hit) {
+                    break;
+                }
+                size_t hoff = (char *)hit - buf;
+                mach_vm_address_t live = off + hoff;   // id 字符数据的活地址
+                // 若该处是 SSO std::string 对象起点，相邻 +24/+48/.. 是同对象其它字段(含昵称)。
+                for (int slot = 1; slot <= 6; slot++) {
+                    NSString *cand = YMNSStringFromLibcppStringObject((const void *)(live + 24 * slot));
+                    if (YMLooksLikeName(cand)) {
+                        counts[cand] = @([counts[cand] intValue] + 1);
+                    }
+                }
+                pos = hoff + 1;
+            }
+            if ((size_t)got < want) {
+                break;
+            }
+            off += (got > 16384 ? got - 16384 : got);
+        }
+    }
+    free(buf);
+
+    NSString *best = nil;
+    int bestN = 0;
+    for (NSString *k in counts) {
+        int n = [counts[k] intValue];
+        if (n > bestN) { bestN = n; best = k; }
+    }
+    return bestN >= 3 ? best : nil;   // 达到频次阈值才采信，否则回退显示 id
+}
+
+// 后台解析 ckey→名字；解析到就更新该会话所有记录的 clabel 并重生成页面（每个 id 只试一次）。
+static void YMEmojiResolveCkeyAsync(NSString *ckey) {
+    if (ckey.length == 0 || [ckey isEqualToString:@"未知"]) {
+        return;
+    }
+    dispatch_async(g_ymEmojiQueue, ^{
+        if (!g_ymNameTried) {
+            g_ymNameTried = [NSMutableSet set];
+        }
+        if ([g_ymNameTried containsObject:ckey]) {
+            return;
+        }
+        [g_ymNameTried addObject:ckey];
+        dispatch_async(dispatch_get_global_queue(QOS_CLASS_UTILITY, 0), ^{
+            @autoreleasepool {
+                NSString *name = YMProbeName(ckey);
+                if (name.length == 0) {
+                    return;
+                }
+                dispatch_async(g_ymEmojiQueue, ^{
+                    BOOL changed = NO;
+                    for (NSMutableDictionary *r in g_ymEmojiRecords) {
+                        if ([r[@"ckey"] isEqualToString:ckey]) {
+                            r[@"clabel"] = name;
+                            changed = YES;
+                        }
+                    }
+                    if (changed) {
+                        [g_ymEmojiRecords writeToFile:kYMEmojiSourceStorePath atomically:YES];
+                        YMEmojiWriteHTMLLocked();
+                        YMLog(@"[EmojiScan] resolved name %@ -> %@", ckey, name);
+                    }
+                });
+            }
+        });
+    });
+}
+
+// 解析一个 <emoji> 标签 → 抽字段 → 分组 → 去重 → 入库 → 重生成页面。
+static void YMEmojiAppendFromTag(NSString *tag) {
+    if (tag.length == 0) {
+        return;
+    }
+    NSString *md5        = YMEmojiAttr(tag, @"md5");
+    NSString *fromUser   = YMEmojiAttr(tag, @"fromusername");
+    NSString *toUser     = YMEmojiAttr(tag, @"tousername");
+
+    // 只接受 url 形态完整(可加载)的副本；残缺副本直接跳过(不锁 md5，留给干净副本)。
+    NSString *url = YMEmojiPickLoadableURL(tag);
+    if (url.length == 0) {
+        return;
+    }
+
+    YMEmojiStoreInit();
+    dispatch_async(g_ymEmojiQueue, ^{
+        @autoreleasepool {
+            NSString *key = md5.length ? md5 : url;
+            if ([g_ymEmojiSeen containsObject:key]) {
+                return;   // 同一张表情(同 md5)已记录
+            }
+            [g_ymEmojiSeen addObject:key];
+
+            BOOL isGroup = [toUser containsString:@"@chatroom"] || [fromUser containsString:@"@chatroom"];
+            NSString *ckey = isGroup ? toUser : (fromUser.length ? fromUser : @"未知");
+            NSTimeInterval now = [[NSDate date] timeIntervalSince1970];
+            NSString *name = [NSString stringWithFormat:@"%@.gif",
+                              md5.length ? [md5 substringToIndex:MIN((NSUInteger)20, md5.length)] : @"emoji"];
+
+            NSMutableDictionary *r = [@{
+                @"t": @(now),
+                @"ts": YMFormatTimestamp((uint32_t)now, 0),
+                @"ckey": ckey,
+                @"clabel": ckey,
+                @"group": @(isGroup),
+                @"nick": fromUser ?: @"",
+                @"url": url,
+                @"md5": md5 ?: @"",
+                @"name": name,
+            } mutableCopy];
+            [g_ymEmojiRecords addObject:r];
+
+            // 昵称/群名解析已停用（启发式不可靠，避免每个新会话白扫内存）。直接显示 id。
+            // 如需恢复：取消下行注释（YMProbeName 频次法仍在）。
+            // YMEmojiResolveCkeyAsync(ckey);
+
+            // 保留 7 天
+            NSTimeInterval cut = now - kYMEmojiRetentionSeconds;
+            NSMutableArray *keep = [NSMutableArray array];
+            for (NSDictionary *x in g_ymEmojiRecords) {
+                if ([x[@"t"] doubleValue] >= cut) { [keep addObject:x]; }
+            }
+            [g_ymEmojiRecords setArray:keep];
+
+            [g_ymEmojiRecords writeToFile:kYMEmojiSourceStorePath atomically:YES];
+            YMEmojiWriteHTMLLocked();
+            YMLog(@"[EmojiScan] emoji md5=%@ group=%d ckey=%@ url=%@", md5, isGroup, ckey, url);
+        }
+    });
+}
+
+// 扫描本进程可写堆内存一遍，找所有 <emoji ...> 标签（mach_vm_read_overwrite 只读，安全）。
+static void YMEmojiScanMemoryOnce(void) {
+    mach_port_t task = mach_task_self();
+    mach_vm_address_t addr = 0;
+    const size_t CHUNK = 8 * 1024 * 1024;
+    const size_t OVERLAP = 16 * 1024;       // 重叠，避免标签跨 chunk 被截断
+    char *buf = (char *)malloc(CHUNK);
+    if (!buf) {
+        return;
+    }
+    uint64_t scanned = 0;
+    const uint64_t BUDGET = 1800ULL * 1024 * 1024;   // 单轮最多扫 ~1.8GB
+
+    while (scanned < BUDGET) {
+        mach_vm_size_t size = 0;
+        vm_region_basic_info_data_64_t info;
+        mach_msg_type_number_t cnt = VM_REGION_BASIC_INFO_COUNT_64;
+        mach_port_t objName = MACH_PORT_NULL;
+        kern_return_t kr = mach_vm_region(task, &addr, &size, VM_REGION_BASIC_INFO_64,
+                                          (vm_region_info_t)&info, &cnt, &objName);
+        if (kr != KERN_SUCCESS) {
+            break;
+        }
+        mach_vm_address_t regStart = addr;
+        mach_vm_address_t regEnd = addr + size;
+        addr = regEnd;   // 下一区域
+
+        BOOL rw = (info.protection & VM_PROT_READ) && (info.protection & VM_PROT_WRITE);
+        if (!rw || size == 0 || size > 96 * 1024 * 1024) {
+            continue;   // 只扫可读写堆，跳过过大区域（图片/缓存几乎不含小 XML）
+        }
+
+        mach_vm_address_t off = regStart;
+        while (off < regEnd) {
+            size_t want = (size_t)MIN((mach_vm_address_t)CHUNK, regEnd - off);
+            mach_vm_size_t got = 0;
+            if (mach_vm_read_overwrite(task, off, want,
+                                       (mach_vm_address_t)buf, &got) != KERN_SUCCESS || got == 0) {
+                break;
+            }
+            scanned += got;
+            size_t pos = 0;
+            while (pos + 6 <= (size_t)got) {
+                void *hit = memmem(buf + pos, (size_t)got - pos, "<emoji", 6);
+                if (!hit) {
+                    break;
+                }
+                size_t hoff = (char *)hit - buf;
+                NSString *tag = YMEmojiTagFromBuffer(buf, (size_t)got, hoff);
+                if (tag) {
+                    @autoreleasepool { YMEmojiAppendFromTag(tag); }
+                }
+                pos = hoff + 6;
+            }
+            if ((size_t)got < want) {
+                break;
+            }
+            off += (got > OVERLAP ? got - OVERLAP : got);   // 重叠步进
+        }
+    }
+    free(buf);
+}
+
+#pragma mark - 表情包信息源：一次性 inline hook + trampoline（已停用，保留备查）
+
+/*
+ 入口被覆盖的位置无关 prologue 字节数 = 绝对跳转字节数：
+   x86_64: movabs r11,imm64(10) + jmp r11(3) = 13B，恰好覆盖
+           push rbp;mov rbp,rsp;push r14;push rbx;mov rbx,rsi;mov r14,rdi（到 0x..91d 边界，
+           下一条 call 完整保留）。
+   arm64 : ldr x16,#8;br x16;.quad(16) = 16B，恰好覆盖前 4 条 stp/add/mov（到 bl 边界）。
+*/
+#if defined(__x86_64__)
+static const size_t kYMEmojiPrologueBytes = 13;
+#elif defined(__arm64__) || defined(__aarch64__)
+static const size_t kYMEmojiPrologueBytes = 16;
+#endif
+
+// 无 NOP 填充的绝对跳转，返回字节数（x86 13 / arm64 16）。
+static size_t YMEmitAbsoluteJumpNoPad(uintptr_t target, uint8_t *out) {
+#if defined(__x86_64__)
+    out[0] = 0x49; out[1] = 0xBB;            // movabs r11, imm64
+    memcpy(out + 2, &target, sizeof(target));
+    out[10] = 0x41; out[11] = 0xFF; out[12] = 0xE3;  // jmp r11
+    return 13;
+#elif defined(__arm64__) || defined(__aarch64__)
+    uint32_t ldr = 0x58000050, br = 0xD61F0200;  // ldr x16,#8 ; br x16
+    memcpy(out + 0, &ldr, 4);
+    memcpy(out + 4, &br, 4);
+    memcpy(out + 8, &target, 8);
+    return 16;
+#endif
+}
+
+// ── 一次性诊断：定位消息内容真正落在哪个入参/偏移（前 N 次调用，限量，事后自停）──
+static std::atomic<int> YMEmojiDiagCalls(0);
+
+static void YMEmojiDiagDump(void *obj, const char *tag) {
+    if (!obj) {
+        return;
+    }
+    for (size_t off = 0; off + 24 <= 768; off += 8) {
+        NSString *v = YMNSStringFromLibcppStringObject((uint8_t *)obj + off);
+        if (v.length == 0) {
+            continue;
+        }
+        NSString *low = v.lowercaseString;
+        if ([low containsString:@"emoji"] || [low containsString:@"cdnurl"] ||
+            [low containsString:@"<msg"] || [low containsString:@"<sysmsg"] ||
+            [low containsString:@"<appmsg"] || [low containsString:@"wxid_"] ||
+            [low containsString:@".gif"] || [low containsString:@"emoticon"] ||
+            [low containsString:@"aeskey"] || [low containsString:@"<emoji"]) {
+            NSString *snip = v.length > 240 ? [v substringToIndex:240] : v;
+            YMLog(@"[EmojiDiag] %s +%zu len=%lu: %@", tag, off, (unsigned long)v.length, snip);
+        }
+    }
+}
+
+static int64_t YMEmojiMsgHandlerHook(int64_t a0, int64_t a1, int64_t a2,
+                                     int64_t a3, int64_t a4, int64_t a5) {
+    // 只读观察（不改参数），命中表情即记录。trampoline=原函数行为，放行。
+    static __thread int inHook = 0;
+    if (!inHook) {
+        inHook = 1;
+        @autoreleasepool {
+            try {
+                int n = YMEmojiDiagCalls.fetch_add(1);
+                if (n < 400) {
+                    // 头 400 次调用：把含消息特征串的入参/偏移打出来，定位内容真实落点。
+                    YMEmojiDiagDump((void *)a1, "a1");
+                    YMEmojiDiagDump((void *)a0, "a0");
+                    YMEmojiDiagDump((void *)a2, "a2");
+                }
+                if (n % 1000 == 0) {
+                    YMLog(@"[EmojiDiag] handler fired count=%d", n);
+                }
+                // 原始消息在 a1(rsi/x1)；保险起见 a1 不中再试 a0。
+                if (!YMEmojiCaptureFromWrap((void *)a1)) {
+                    YMEmojiCaptureFromWrap((void *)a0);
+                }
+            } catch (...) {}
+        }
+        inHook = 0;
+    }
+    if (!YMEmojiTrampoline) {
+        return 0;
+    }
+    return ((YMEmojiMsgHandlerFunc)YMEmojiTrampoline)(a0, a1, a2, a3, a4, a5);
+}
+
+// 分配可执行 trampoline：[原 prologue 字节][绝对跳转回 原入口+prologue]。
+static uintptr_t YMEmojiBuildTrampoline(uintptr_t funcEntry) {
+    size_t total = kYMEmojiPrologueBytes + 16;   // prologue + 一条绝对跳转(最多16B)
+    vm_address_t mem = 0;
+    if (vm_allocate(mach_task_self(), &mem, total, VM_FLAGS_ANYWHERE) != KERN_SUCCESS) {
+        return 0;
+    }
+    uint8_t *p = (uint8_t *)mem;
+    memcpy(p, (const void *)funcEntry, kYMEmojiPrologueBytes);       // 原 prologue
+    YMEmitAbsoluteJumpNoPad(funcEntry + kYMEmojiPrologueBytes,
+                            p + kYMEmojiPrologueBytes);              // 跳回续跑点
+    if (vm_protect(mach_task_self(), mem, total, false,
+                   VM_PROT_READ | VM_PROT_EXECUTE) != KERN_SUCCESS) {
+        vm_deallocate(mach_task_self(), mem, total);
+        return 0;
+    }
+    sys_icache_invalidate((void *)mem, total);
+    return (uintptr_t)mem;
+}
+
+static void YMInstallEmojiSourcePatch(void) {
+    if (YMEmojiTrampoline) {
+        return;   // 已安装
+    }
+    const YMWeChatAdaptProfile *profile = YMGetActiveProfile();
+    if (!profile || profile->emojiMsgHandlerVA == 0) {
+        YMLog(@"[EmojiSource] emojiMsgHandlerVA is 0, skip safely");
+        return;
+    }
+    uintptr_t addr = YMRuntimeAddress(profile->emojiMsgHandlerVA);
+    if (addr == 0) {
+        YMLog(@"[EmojiSource] runtime address 0 (slide not ready), skip");
+        return;
+    }
+
+    uintptr_t tramp = YMEmojiBuildTrampoline(addr);
+    if (!tramp) {
+        YMLog(@"[EmojiSource] build trampoline failed");
+        return;
+    }
+
+    // 入口一次性打绝对跳转到 hook（之后再不动它，零 per-call 开销）。
+    uint8_t patch[16] = {0};
+    size_t n = YMEmitAbsoluteJumpNoPad((uintptr_t)&YMEmojiMsgHandlerHook, patch);
+    if (!YMGroupExitWriteCodeBytes(addr, patch, n, "emoji handler", "install inline hook")) {
+        YMLog(@"[EmojiSource] install inline hook failed");
+        vm_deallocate(mach_task_self(), (vm_address_t)tramp, kYMEmojiPrologueBytes + 16);
+        return;
+    }
+    YMEmojiTrampoline = tramp;
+    YMEmojiMsgHandlerRuntimeAddress = addr;
+    YMLog(@"[EmojiSource] installed(inline+trampoline) entry=0x%lx tramp=0x%lx",
+          (unsigned long)addr, (unsigned long)tramp);
+}
+
 #pragma mark - 安装 Patch
 
 static BOOL YMPatchAntiRevokeWithSlide(intptr_t slide, NSString *source) {
@@ -4733,6 +5621,51 @@ static void YMInstallOpenURLWithSystemBrowserIfNeeded(void) {
     });
 }
 
+// 独立解析 wechat.dylib slide（不依赖防撤回是否开启），再安装表情包信息源 hook。
+static void YMEmojiResolveSlideIfNeeded(void) {
+    if (YMWeChatDylibSlide != 0) {
+        return;
+    }
+    uint32_t count = _dyld_image_count();
+    for (uint32_t i = 0; i < count; i++) {
+        const char *name = _dyld_get_image_name(i);
+        if (!name) {
+            continue;
+        }
+        NSString *imagePath = [NSString stringWithUTF8String:name];
+        if (YMIsTargetWeChatResourceDylibPath(imagePath)) {
+            YMWeChatDylibSlide = (uintptr_t)_dyld_get_image_vmaddr_slide(i);
+            YMLog(@"[EmojiSource] resolved wechat.dylib slide=0x%lx", (unsigned long)YMWeChatDylibSlide);
+            return;
+        }
+    }
+}
+
+static void YMInstallEmojiSourceIfNeeded(void) {
+    // 进程内内存扫描方案：只读扫自己进程的堆找 <emoji>，不 hook、不改字节、不会崩，
+    // 也不依赖微信版本/地址。启动后定时增量扫描（按 md5 去重）。
+    static dispatch_source_t timer = nil;
+    static dispatch_once_t once;
+    dispatch_once(&once, ^{
+        // 启动即用最新模板重生成一次页面（不必等新表情），保证打开就是新版页面/工具栏。
+        YMEmojiStoreInit();
+        dispatch_async(g_ymEmojiQueue, ^{ YMEmojiWriteHTMLLocked(); });
+
+        dispatch_queue_t q = dispatch_queue_create("ym.emoji.scan", DISPATCH_QUEUE_SERIAL);
+        timer = dispatch_source_create(DISPATCH_SOURCE_TYPE_TIMER, 0, 0, q);
+        // 启动 5 秒后开始，每 8 秒扫一轮。
+        dispatch_source_set_timer(timer,
+                                  dispatch_time(DISPATCH_TIME_NOW, (int64_t)(5 * NSEC_PER_SEC)),
+                                  (uint64_t)(8 * NSEC_PER_SEC),
+                                  (uint64_t)(1 * NSEC_PER_SEC));
+        dispatch_source_set_event_handler(timer, ^{
+            @autoreleasepool { YMEmojiScanMemoryOnce(); }
+        });
+        dispatch_resume(timer);
+        YMLog(@"[EmojiScan] in-process memory scanner started (every 8s)");
+    });
+}
+
 #pragma mark - 撤回路径诊断（x86_64 instrument-and-observe）
 /*
  纯静态分析已证伪 "block 整个 0x2b93f40/0x2b94050 能阻止撤回"，真正的
@@ -4754,26 +5687,17 @@ typedef struct {
 } YMDiagEntry;
 
 static YMDiagEntry gYMDiagTable[] = {
-    // 兜底锚点：撤回必然要按 svrid 找到原消息。它的 backtrace 直接暴露真正的 handler。
-    { "GetMsgBySvrId_2a176b0", 0x2a176b0, 0, {0}, {0}, NO },
-    // 未测过的 svrid-caller 函数（上一轮 7 个已证伪，全部换新）。
-    { "f_2a172f0", 0x2a172f0, 0, {0}, {0}, NO },
-    { "f_2a726d0", 0x2a726d0, 0, {0}, {0}, NO },
-    { "f_2abba80", 0x2abba80, 0, {0}, {0}, NO },
-    { "f_2abde80", 0x2abde80, 0, {0}, {0}, NO },
-    { "f_2af1510", 0x2af1510, 0, {0}, {0}, NO },
-    { "f_2b081d0", 0x2b081d0, 0, {0}, {0}, NO },
-    { "f_2b115b0", 0x2b115b0, 0, {0}, {0}, NO },
-    { "f_2b29cb0", 0x2b29cb0, 0, {0}, {0}, NO },
-    { "f_2b2e770", 0x2b2e770, 0, {0}, {0}, NO },
-    { "f_2b39580", 0x2b39580, 0, {0}, {0}, NO },
-    { "f_2bb5580", 0x2bb5580, 0, {0}, {0}, NO },
-    { "f_2bc9800", 0x2bc9800, 0, {0}, {0}, NO },
-    { "f_2bd7b10", 0x2bd7b10, 0, {0}, {0}, NO },
-    { "f_2be05b0", 0x2be05b0, 0, {0}, {0}, NO },
-    { "f_2beb800", 0x2beb800, 0, {0}, {0}, NO },
-    { "f_2ce32f0", 0x2ce32f0, 0, {0}, {0}, NO },
-    { "f_2d1f2b0", 0x2d1f2b0, 0, {0}, {0}, NO },
+    // 收消息流水线候选（来自撤回实机 trace 的共享 sync/message 层；普通收到的表情也会过）。
+    // 目标：收一个表情→看哪个函数的某入参里能扫到 <emoji（=该函数持有消息对象，即正确 hook 点）。
+    { "pipe_3feddc0", 0x3feddc0, 0, {0}, {0}, NO },
+    { "pipe_3fdf410", 0x3fdf410, 0, {0}, {0}, NO },
+    { "pipe_4006920", 0x4006920, 0, {0}, {0}, NO },
+    { "pipe_403a080", 0x403a080, 0, {0}, {0}, NO },
+    { "pipe_400e000", 0x400e000, 0, {0}, {0}, NO },
+    // 撤回 handler 外层(收到撤回会走；普通消息分支邻近，args 可能也带消息对象)。
+    { "h_2bd6250", 0x2bd6250, 0, {0}, {0}, NO },
+    { "h_2bd62d0", 0x2bd62d0, 0, {0}, {0}, NO },
+    { "h_2bd61b0", 0x2bd61b0, 0, {0}, {0}, NO },
 };
 #define YM_DIAG_COUNT ((int)(sizeof(gYMDiagTable)/sizeof(gYMDiagTable[0])))
 
@@ -4796,24 +5720,43 @@ static int64_t YMDiagCommon(int idx,
         gYMDiagInHook = 1;
         @autoreleasepool {
             int seq = gYMDiagSeq.fetch_add(1);
-            uintptr_t slide = YMWeChatDylibSlide;
-            uintptr_t callerVA = (uintptr_t)caller - slide;
-
-            void *bt[20];
-            int n = backtrace(bt, 20);
-            NSMutableString *chain = [NSMutableString string];
-            BOOL first = YES;
-            for (int i = 1; i < n; i++) {
-                uintptr_t rel = (uintptr_t)bt[i] - slide;
-                if (rel < kYMTextLo || rel > kYMTextHi) continue; // 只留微信本体帧
-                [chain appendFormat:@"%@0x%lx", (first ? @"" : @" <- "), (unsigned long)rel];
-                first = NO;
+            // 限量扫描（前若干次调用），避免持续拖慢。扫 a1..a3 的浅层 std::string 找 <emoji。
+            if (seq < 6000) {
+                uintptr_t slide = YMWeChatDylibSlide;
+                const int64_t args[3] = {a1, a2, a3};
+                for (int ai = 0; ai < 3; ai++) {
+                    void *obj = (void *)args[ai];
+                    if (!obj) {
+                        continue;
+                    }
+                    for (size_t off = 0; off + 24 <= 640; off += 8) {
+                        NSString *v = YMNSStringFromLibcppStringObject((uint8_t *)obj + off);
+                        if (v.length == 0) {
+                            continue;
+                        }
+                        NSString *low = v.lowercaseString;
+                        if (![low containsString:@"<emoji"] && ![low containsString:@"cdnurl"]) {
+                            continue;
+                        }
+                        // 命中！这个函数的 arg[ai]+off 持有表情消息对象 → 正确 hook 点。
+                        void *bt[20];
+                        int n = backtrace(bt, 20);
+                        NSMutableString *chain = [NSMutableString string];
+                        BOOL first = YES;
+                        for (int i = 1; i < n; i++) {
+                            uintptr_t rel = (uintptr_t)bt[i] - slide;
+                            if (rel < kYMTextLo || rel > kYMTextHi) {
+                                continue;
+                            }
+                            [chain appendFormat:@"%@0x%lx", (first ? @"" : @" <- "), (unsigned long)rel];
+                            first = NO;
+                        }
+                        NSString *snip = v.length > 220 ? [v substringToIndex:220] : v;
+                        YMLog(@"[EmojiHit] %s arg=%d off=%zu len=%lu bt: %@ : %@",
+                              e->name, ai, off, (unsigned long)v.length, chain, snip);
+                    }
+                }
             }
-            YMLog(@"[Diag#%d] %s a1=0x%llx a2=0x%llx a3=0x%llx a4=0x%llx caller=0x%lx | bt: %@",
-                  seq, e->name,
-                  (unsigned long long)a1,(unsigned long long)a2,
-                  (unsigned long long)a3,(unsigned long long)a4,
-                  (unsigned long)callerVA, chain);
         }
         gYMDiagInHook = 0;
     }
@@ -4898,19 +5841,103 @@ static void YMLoadFeatureSwitchesFromDefaults(void) {
     YMFeatureOpenURLWithSystemBrowserEnabled = [defaults boolForKey:kUseSystemWeb];
 }
 
+#pragma mark - Phase A 诊断：NSWorkspace openURL backtrace（定位 x86 GetUrlWebViewKind）
+/*
+ GetUrlWebViewKind 是 C++ 函数、无任何引用、加密串逐架构不同，静态定位失败。
+ 利用：链接消息右键"Open with Default Browser"→最终走 -[NSWorkspace openURL:]。
+ swizzle 它(跨架构 ObjC)，打印 wechat.dylib 帧 backtrace。用户右键打开链接一次，
+ 日志里的 wechat 帧链就暴露 WeChat 的 URL-open / 浏览器处理代码，反推 GetUrlWebViewKind。
+*/
+static BOOL (*YMOrig_NSWorkspace_openURL)(id, SEL, id) = NULL;
+static BOOL YMHook_NSWorkspace_openURL(id self, SEL _cmd, id url) {
+    @autoreleasepool {
+        void *bt[28];
+        int n = backtrace(bt, 28);
+        uintptr_t slide = YMWeChatDylibSlide;
+        NSMutableString *chain = [NSMutableString string];
+        for (int i = 1; i < n; i++) {
+            uintptr_t rel = (uintptr_t)bt[i] - slide;
+            if (slide && rel >= 0x15000 && rel <= 0x6d9c780) {
+                [chain appendFormat:@"0x%lx ", (unsigned long)rel];
+            }
+        }
+        YMLog(@"[OpenURLDiag] openURL:%@ | slide=0x%lx wechat-frames: %@",
+              url, (unsigned long)slide, chain.length ? chain : @"(none)");
+    }
+    if (YMOrig_NSWorkspace_openURL) {
+        return YMOrig_NSWorkspace_openURL(self, _cmd, url);
+    }
+    return NO;
+}
+// 通用：记录某 ObjC 方法调用时的 wechat 帧 backtrace（捕获左键点击→应用内浏览器路径）。
+static void YMDiagLogBacktrace(const char *tag, id arg) {
+    @autoreleasepool {
+        void *bt[28]; int n = backtrace(bt, 28);
+        uintptr_t slide = YMWeChatDylibSlide;
+        NSMutableString *chain = [NSMutableString string];
+        for (int i = 1; i < n; i++) {
+            uintptr_t rel = (uintptr_t)bt[i] - slide;
+            if (slide && rel >= 0x15000 && rel <= 0x6d9c780)
+                [chain appendFormat:@"0x%lx ", (unsigned long)rel];
+        }
+        YMLog(@"[OpenURLDiag] %s arg=%@ | wechat-frames: %@", tag, arg, chain.length?chain:@"(none)");
+    }
+}
+static IMP YMOrig_WKWebView_loadRequest = NULL;
+static id YMHook_WKWebView_loadRequest(id self, SEL _cmd, id req) {
+    YMDiagLogBacktrace("WKWebView.loadRequest:", [req respondsToSelector:@selector(URL)] ? [req performSelector:@selector(URL)] : req);
+    return ((id(*)(id,SEL,id))YMOrig_WKWebView_loadRequest)(self,_cmd,req);
+}
+static IMP YMOrig_NSWC_showWindow = NULL;
+static id YMHook_NSWC_showWindow(id self, SEL _cmd, id sender) {
+    YMDiagLogBacktrace("NSWindowController.showWindow:", NSStringFromClass([self class]));
+    return ((id(*)(id,SEL,id))YMOrig_NSWC_showWindow)(self,_cmd,sender);
+}
+static void YMSwizzleLog(const char *clsName, const char *selName, IMP newImp, IMP *origOut) {
+    Class cls = objc_getClass(clsName);
+    if (!cls) { YMLog(@"[OpenURLDiag] class %s not found", clsName); return; }
+    Method m = class_getInstanceMethod(cls, sel_registerName(selName));
+    if (!m) { YMLog(@"[OpenURLDiag] -[%s %s] not found", clsName, selName); return; }
+    *origOut = method_getImplementation(m);
+    method_setImplementation(m, newImp);
+    YMLog(@"[OpenURLDiag] hooked -[%s %s]", clsName, selName);
+}
+static void YMInstallOpenURLDiag(void) {
+    static BOOL installed = NO;
+    if (installed) return;
+    installed = YES;
+    // 1) 系统浏览器路径（右键 Open with Default Browser）
+    Class ws = objc_getClass("NSWorkspace");
+    Method m = ws ? class_getInstanceMethod(ws, sel_registerName("openURL:")) : NULL;
+    if (m) { YMOrig_NSWorkspace_openURL=(BOOL(*)(id,SEL,id))method_getImplementation(m);
+             method_setImplementation(m,(IMP)YMHook_NSWorkspace_openURL);
+             YMLog(@"[OpenURLDiag] hooked -[NSWorkspace openURL:]"); }
+    // 2) 左键点击→应用内浏览器路径（捕获调用 GetUrlWebViewKind 的 click handler）
+    YMSwizzleLog("WKWebView", "loadRequest:", (IMP)YMHook_WKWebView_loadRequest, &YMOrig_WKWebView_loadRequest);
+    YMSwizzleLog("NSWindowController", "showWindow:", (IMP)YMHook_NSWC_showWindow, &YMOrig_NSWC_showWindow);
+}
+
 __attribute__((constructor))
 static void YMWeChatAntiRevokePatchEntry(void) {
     @autoreleasepool {
         YMLog(@"constructor called");
-        
+
         YMLoadFeatureSwitchesFromDefaults();
 
         YMInstallMultiOpenPatch();
-        
+
+        // Phase A 诊断：仅当用户在菜单开启"使用系统浏览器"时安装(定位 x86 地址用)。
+        if (YMIsOpenURLWithSystemBrowserEnabled()) {
+            YMInstallOpenURLDiag();
+        }
+
         YMInstallOpenURLWithSystemBrowserIfNeeded();
         YMInstallGroupExitMonitorIfNeeded();
         YMInstallAssistantMenu();
         YMInstallAntiUpdateIfNeeded();
         YMInstallAntiRevokeIfNeeded();
+        YMInstallEmojiSourceIfNeeded();
+
+        [YMAutoLogin startIfEnabled];
     }
 }

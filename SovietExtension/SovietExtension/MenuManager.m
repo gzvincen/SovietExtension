@@ -9,6 +9,7 @@
 #import "NSMenuItem+Action.h"
 #import "NSMenu+Action.h"
 #import "YMSwizzledHelper.h"
+#import "AutoLogin.h"
 
 @implementation MenuManager
 
@@ -43,7 +44,17 @@
     NSMenuItem *useSystemWebMenu = [self ym_toggleMenuItemWithTitle:@"使用系统浏览器"
                                                                 key:kUseSystemWeb
                                                              action:@selector(onUseSystemWeb:)];
-    
+
+    NSMenuItem *autoLoginMenu = [self ym_toggleMenuItemWithTitle:@"自动登陆"
+                                                             key:kAutoLogin
+                                                          action:@selector(onAutoLogin:)];
+
+    NSMenuItem *viewEmojiSourceMenu = [NSMenuItem menuItemWithTitle:@"查看表情包信息源"
+                                                            action:@selector(onViewEmojiSource:)
+                                                            target:self
+                                                     keyEquivalent:@""
+                                                             state:NO];
+
     NSMenuItem *newWeChatMenu = [NSMenuItem menuItemWithTitle:@"多开"
                                                        action:@selector(onNewWeChat:)
                                                        target:self
@@ -64,6 +75,8 @@
         antiRevokeMenu,
         exitChatroomMenu,
         useSystemWebMenu,
+        autoLoginMenu,
+        viewEmojiSourceMenu,
         newWeChatMenu,
         currentVersionMenu
     ]];
@@ -95,21 +108,49 @@
 
 - (void)onExitChatroom:(NSMenuItem *)item
 {
-    [self ym_confirmToggleMenuItem:item
-                   userDefaultsKey:kExitChatroom
-                   informativeText:@"重启微信生效"];
+    [self ym_showUnsupported];
 }
 
 - (void)onUseSystemWeb:(NSMenuItem *)item
 {
-    [self ym_confirmToggleMenuItem:item
-                   userDefaultsKey:kUseSystemWeb
-                   informativeText:@"重启微信生效"];
+    [self ym_showUnsupported];
+}
+
+// 暂未支持的功能：点击只弹提示，不切换状态、不重启。
+- (void)ym_showUnsupported
+{
+    NSAlert *alert = [[NSAlert alloc] init];
+    alert.messageText = @"提示";
+    alert.informativeText = @"暂时不支持此功能";
+    [alert addButtonWithTitle:@"好的"];
+    [alert runModal];
 }
 
 - (void)onNewWeChat:(NSMenuItem *)item
 {
     [self executeShellCommand:@"open -n /Applications/WeChat.app"];
+}
+
+// 自动登陆即时生效，无需重启微信。
+- (void)onAutoLogin:(NSMenuItem *)item
+{
+    BOOL enabled = item.state != NSControlStateValueOn;
+    [self ym_setMenuItem:item enabled:enabled userDefaultsKey:kAutoLogin];
+    [YMAutoLogin setEnabled:enabled];
+}
+
+// 打开滚动 HTML 查看器（浏览器，每 3 秒自动刷新）。
+- (void)onViewEmojiSource:(NSMenuItem *)item
+{
+    NSString *path = @"/tmp/wechat_emoji_source.html";
+    if (![[NSFileManager defaultManager] fileExistsAtPath:path]) {
+        [@"<!doctype html><meta charset=utf-8><meta http-equiv=refresh content=3>"
+         @"<body style='font-family:-apple-system;padding:30px;color:#666'>"
+         @"暂无表情包信息源。开启「表情包信息源」并重启微信后，收到表情包消息时会自动出现。"
+         @"</body>"
+            writeToFile:path atomically:YES encoding:NSUTF8StringEncoding error:nil];
+    }
+    [self executeShellCommand:[NSString stringWithFormat:@"open '%@'", path]];
 }
 
 #pragma mark - Menu Helpers
