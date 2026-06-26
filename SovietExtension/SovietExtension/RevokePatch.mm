@@ -4303,6 +4303,8 @@ static BOOL YMPatchRevokeX86Callsite(uintptr_t slide, uintptr_t callSiteVA) {
 static NSString * const kYMEmojiSourceHTMLPath = @"/tmp/wechat_emoji_source.html";
 static NSString * const kYMEmojiSourceStorePath = @"/tmp/wechat_emoji_source.plist";
 static const NSTimeInterval kYMEmojiRetentionSeconds = 7 * 24 * 60 * 60;  // 保留 7 天
+// 抓取开关(运行时可开关, 不需重启)。关闭时定时器仍在但不扫描, 开销可忽略。默认关闭。
+static BOOL g_ymEmojiCaptureEnabled = NO;
 
 static uintptr_t YMEmojiMsgHandlerRuntimeAddress = 0;   // 原函数入口（已被打补丁）
 static uintptr_t YMEmojiTrampoline = 0;                 // 执行原 prologue+续跑的跳板
@@ -4952,7 +4954,9 @@ static void YMEmojiScanMemoryOnce(void) {
         return;
     }
     uint64_t scanned = 0;
-    const uint64_t BUDGET = 1800ULL * 1024 * 1024;   // 单轮最多扫 ~1.8GB
+    // 覆盖全堆：表情可能落在很高地址的区域（搜索/转发发送、快速连发都会到 1.8GB 之外），
+    // 预算太小会漏。实测微信可写堆约 3-4GB，这里给足。区域上限 256MB(放过中等堆，仍跳超大缓存)。
+    const uint64_t BUDGET = 6000ULL * 1024 * 1024;
 
     while (scanned < BUDGET) {
         mach_vm_size_t size = 0;
@@ -4969,8 +4973,8 @@ static void YMEmojiScanMemoryOnce(void) {
         addr = regEnd;   // 下一区域
 
         BOOL rw = (info.protection & VM_PROT_READ) && (info.protection & VM_PROT_WRITE);
-        if (!rw || size == 0 || size > 96 * 1024 * 1024) {
-            continue;   // 只扫可读写堆，跳过过大区域（图片/缓存几乎不含小 XML）
+        if (!rw || size == 0 || size > 256 * 1024 * 1024) {
+            continue;   // 只扫可读写堆，跳过超大区域（图片/缓存几乎不含小 XML）
         }
 
         mach_vm_address_t off = regStart;
@@ -5858,11 +5862,26 @@ static void YMInstallEmojiSourceIfNeeded(void) {
                                   (uint64_t)(8 * NSEC_PER_SEC),
                                   (uint64_t)(1 * NSEC_PER_SEC));
         dispatch_source_set_event_handler(timer, ^{
+            if (!g_ymEmojiCaptureEnabled) {
+                return;   // 抓取关闭 → 跳过扫描(开销可忽略)
+            }
             @autoreleasepool { YMEmojiScanMemoryOnce(); }
         });
         dispatch_resume(timer);
         YMLog(@"[EmojiScan] in-process memory scanner started (every 8s)");
     });
+}
+
+// 运行时开/关抓取(菜单调用, 不需重启微信)。开启时立即扫一遍提升响应。
+// extern "C": 本文件是 .mm(C++), 而 MenuManager.m 是 .m(C 链接), 需 C 符号才能链上。
+extern "C" void YMEmojiSetCaptureEnabled(BOOL enabled) {
+    g_ymEmojiCaptureEnabled = enabled;
+    YMLog(@"[EmojiScan] capture enabled=%d", enabled);
+    if (enabled) {
+        dispatch_async(dispatch_get_global_queue(QOS_CLASS_UTILITY, 0), ^{
+            @autoreleasepool { YMEmojiScanMemoryOnce(); }
+        });
+    }
 }
 
 #pragma mark - 撤回路径诊断（x86_64 instrument-and-observe）
@@ -6038,6 +6057,10 @@ static void YMLoadFeatureSwitchesFromDefaults(void) {
     YMFeatureAntiRevokeEnabled = [defaults boolForKey:kAntiRevoke];
     YMFeatureGroupExitMonitorEnabled = [defaults boolForKey:kExitChatroom];
     YMFeatureOpenURLWithSystemBrowserEnabled = [defaults boolForKey:kUseSystemWeb];
+
+    // 抓取表情包默认关闭(省开销)；用户可在菜单开启。
+    [defaults registerDefaults:@{ kEmojiCapture: @NO }];
+    g_ymEmojiCaptureEnabled = [defaults boolForKey:kEmojiCapture];
 }
 
 #pragma mark - Phase A 诊断：NSWorkspace openURL backtrace（定位 x86 GetUrlWebViewKind）

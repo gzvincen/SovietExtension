@@ -13,6 +13,7 @@ static NSString *kAntiRevoke = @"kAntiRevoke.SOVIET";
 static NSString *kExitChatroom = @"kExitChatroom.SOVIET";
 static NSString *kUseSystemWeb = @"kUseSystemWeb.SOVIET";
 static NSString *kAutoLogin = @"kAutoLogin.SOVIET";
+static NSString *kEmojiCapture = @"kEmojiCapture.SOVIET";
 static NSString *kIsFirstLoad = @"kIsFirstLoad.SOVIET";
 static NSString *kCurrentVersion = @"1.0.7";
 

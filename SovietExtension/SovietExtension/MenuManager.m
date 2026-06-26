@@ -11,6 +11,14 @@
 #import "YMSwizzledHelper.h"
 #import "AutoLogin.h"
 
+// 运行时开/关表情抓取(定义在 RevokePatch.mm, 不需重启)。
+extern void YMEmojiSetCaptureEnabled(BOOL enabled);
+
+@interface MenuManager ()
+// 持有"查看表情包信息源"项, 抓取关闭时置灰。
+@property (nonatomic, strong) NSMenuItem *viewEmojiSourceItem;
+@end
+
 @implementation MenuManager
 
 #pragma mark - Singleton
@@ -23,6 +31,19 @@
         share = [[self alloc] init];
     });
     return share;
+}
+
+#pragma mark - Menu Validation
+
+// AppKit 调用此方法决定菜单项是否可用。覆盖 autoenablesItems 的默认行为。
+- (BOOL)validateMenuItem:(NSMenuItem *)menuItem
+{
+    SEL action = [menuItem action];
+    if (action == @selector(onViewEmojiSource:)) {
+        // 「查看表情包信息源」只有抓取开启时才可用
+        return [[NSUserDefaults standardUserDefaults] boolForKey:kEmojiCapture];
+    }
+    return YES;  // 其他菜单项正常可用
 }
 
 #pragma mark - Public
@@ -49,11 +70,19 @@
                                                              key:kAutoLogin
                                                           action:@selector(onAutoLogin:)];
 
+    BOOL captureOn = [[NSUserDefaults standardUserDefaults] boolForKey:kEmojiCapture];
+
+    NSMenuItem *emojiCaptureMenu = [self ym_toggleMenuItemWithTitle:@"抓取表情包信息源"
+                                                                key:kEmojiCapture
+                                                             action:@selector(onToggleEmojiCapture:)];
+
     NSMenuItem *viewEmojiSourceMenu = [NSMenuItem menuItemWithTitle:@"查看表情包信息源"
                                                             action:@selector(onViewEmojiSource:)
                                                             target:self
                                                      keyEquivalent:@""
                                                              state:NO];
+    viewEmojiSourceMenu.enabled = captureOn;   // 抓取关闭时置灰不可点
+    self.viewEmojiSourceItem = viewEmojiSourceMenu;
 
     NSMenuItem *newWeChatMenu = [NSMenuItem menuItemWithTitle:@"多开"
                                                        action:@selector(onNewWeChat:)
@@ -76,6 +105,7 @@
         exitChatroomMenu,
         useSystemWebMenu,
         autoLoginMenu,
+        emojiCaptureMenu,
         viewEmojiSourceMenu,
         newWeChatMenu,
         currentVersionMenu
@@ -139,9 +169,21 @@
     [YMAutoLogin setEnabled:enabled];
 }
 
+// 抓取表情包开关：进程内扫描即时开/关，无需重启微信。
+- (void)onToggleEmojiCapture:(NSMenuItem *)item
+{
+    BOOL enabled = item.state != NSControlStateValueOn;
+    [self ym_setMenuItem:item enabled:enabled userDefaultsKey:kEmojiCapture];
+    YMEmojiSetCaptureEnabled(enabled);
+    self.viewEmojiSourceItem.enabled = enabled;   // 关闭时置灰"查看"项
+}
+
 // 打开滚动 HTML 查看器（浏览器，每 3 秒自动刷新）。
 - (void)onViewEmojiSource:(NSMenuItem *)item
 {
+    if (![[NSUserDefaults standardUserDefaults] boolForKey:kEmojiCapture]) {
+        return;   // 抓取关闭时不可用
+    }
     NSString *path = @"/tmp/wechat_emoji_source.html";
     if (![[NSFileManager defaultManager] fileExistsAtPath:path]) {
         [@"<!doctype html><meta charset=utf-8><meta http-equiv=refresh content=3>"
