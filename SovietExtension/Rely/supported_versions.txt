@@ -27,3 +27,4 @@
 # *|*|*|Allow all versions, not recommended
 
 4.1.10.53|4.1.10|268853|Tested on Mac WeChat 4.1.10.53
+4.1.12.x|4.1.12|269340|Intel x86_64 anti-revoke and detailed notice runtime tested

@@ -1,7 +1,7 @@
 # Intel (x86_64) 适配逆向指南
 
-本文档记录把 SovietExtension 防撤回 / 多开移植到 **Intel 芯片 Mac** 还差的最后一步：
-逆向 **x86_64 版 `wechat.dylib`** 的函数地址。
+本文档记录 SovietExtension 防撤回 / 多开在 **Intel 芯片 Mac** 上的适配方法，以及已完成版本的
+**x86_64 `wechat.dylib`** 静态地址和结构漂移。
 
 ## 已完成的部分（无需逆向）
 
@@ -13,8 +13,8 @@
 | 苏维埃助手菜单 | ✅ | 纯 Cocoa，架构无关 |
 | x86_64 补丁原语 | ✅ | `YMPatchX86ReturnYES` / `YMPatchX86AbsoluteJump` |
 | x86_64 安全护栏 | ✅ | 地址未填时自动跳过补丁，**不会乱写、不崩溃** |
-| **防撤回 (Anti-Revoke)** | ❌ | **需要本文档的逆向** |
-| **真·多开 (Multi-Open)** | ❌ | **需要本文档的逆向** |
+| **防撤回 (Anti-Revoke)** | ✅ | 4.1.10、4.1.12 / 269340 的核心拦截和详细灰条均已实测 |
+| **真·多开 (Multi-Open)** | ✅ / 部分 | 4.1.10 已适配；4.1.12 地址尚未确认，安全跳过 |
 
 ## 为什么不能直接复用 arm64 的地址
 
@@ -24,23 +24,95 @@ ASLR slide 定位 `wechat.dylib` 内部函数，再写入机器码补丁。
 - arm64 切片和 x86_64 切片虽然来自同一份源码，但**函数地址完全不同**。
 - 补丁字节也不同：arm64 是 `mov w0,#1; ret`，x86_64 是 `mov eax,1; ret`（代码里已分别实现）。
 
-所以必须在 **x86_64 切片**上重新逆向得到下面 6 个地址。
+所以每个新 build 都必须在 **x86_64 切片**上重新确认调用点和布局，不能只沿用旧地址。
+
+## 4.1.12 / 269340 防撤回适配（2026-07-27）
+
+当前 Intel 微信信息：
+
+```text
+CFBundleShortVersionString = 4.1.12
+CFBundleVersion = 269340
+```
+
+从 universal `wechat.dylib` 切出的 x86_64 切片中，已定位新版
+`CoReplaceOriginMessageByRevoke` 等价函数：
+
+```text
+函数入口：          0x3433c90
+原消息查询 callsite：0x34346db
+真实查询函数：      0x300cfe0
+```
+
+调用点反汇编：
+
+```asm
+34346bf: mov rdx, [rbp-0x670]
+34346c6: mov rcx, [rdx+0x198]   ; svrId
+34346cd: add rdx, 0x1b8         ; session std::string*
+34346d4: lea rdi, [rbp-0x948]   ; outWrap
+34346db: call 0x300cfe0
+```
+
+与 4.1.10 / 268853 相比，关键布局发生了以下漂移：
+
+| 字段 | 4.1.10 | 4.1.12 |
+|---|---:|---:|
+| context 中的 `svrId` | `0x168` | `0x198` |
+| session 参数 | `0x188` | `0x1b8` |
+| 查询结果有效 / UI 替换标志 | `0x268` (616) | `0x270` (624) |
+| 查询结果拷贝大小 | `0x270` | `0x278` |
+
+新版标志偏移可由以下指令关系确认：查询前 `mov edx, 0x278`，结果位于
+`[rbp-0x948]`，查询后判断 `cmp byte ptr [rbp-0x6d8], 1`，两者相差 `0x270`。
+
+实现上，`RevokePatch.mm` 的 `YMRevokeX86CallsiteLayout` 按 profile 保存这些偏移。
+wrapper 调用真实查询后立即清有效标志，从而保留原消息。
+
+详细灰条也已静态确认：完整 XML 模板位于 `0x8a331c0`，有两个函数引用。其中
+`0x43e41b0` 的入口调用约定是 `rsi=session std::string*`、`rdx=content std::string*`，
+且会构造 type=10000 MessageWrap，因此它是新版 `insertPaySysMsgToSessionVA`。
+MessageWrap 构造函数和 `SetMsgType` 交叉确认详细字段仍为：
+
+```text
+originTypeOffset          = 0x108
+originCreateTimeMsOffset  = 0x100
+originCreateTimeSecOffset = 0x114
+originContentOffset       = 0x130
+```
+
+`SetMsgType` 会同时写 `+0x0c` 和 `+0x108`；灰条构造函数分别在 `+0x100`、`+0x114`、
+`+0x130` 填入毫秒时间、秒时间和格式化后的 XML 内容。
+
+安装后用普通文字消息完成实机撤回测试，日志确认完整链路：
+
+```text
+[X86Callsite] origin captured ... type=1 ... contentLen=7
+[RevokeCallsite] insert detailed notice result=<non-zero>
+```
+
+原消息保留，包含消息类型、原文、撤回人和时间的自定义详细灰条成功插入。
+
+安装补丁前还会校验 callsite 前 28 字节的四条参数准备指令、`svrId/session` 偏移以及
+`E8` opcode。地址或结构不匹配时会拒绝写入，避免误 patch 其他调用。
 
 ## 需要逆向填入的字段
 
-文件：`SovietExtension/RevokePatch.mm`，`#elif defined(__x86_64__)` 分支下的两个 profile
-（4.1.9.58 / 268602 和 4.1.10.53 / 268853），把对应的 `0` 替换为真实静态 VA：
+文件：`SovietExtension/RevokePatch.mm`，`#elif defined(__x86_64__)` 分支下对应版本的 profile。
+4.1.10 已完成全部关键地址；适配新版本时按功能逐项确认，未知字段保持为 `0`：
 
 | 字段 | arm64(4.1.10) 参考 | 含义 / 逆向线索 |
 |---|---|---|
-| `hookPointerVA` | `0x2846E84` | `ym_HandleSysMsg_RevokeMsg` 函数入口。x86_64 建议用 inline hook（已设 `YMRevokeHookModeInline`），填函数入口 VA |
+| `hookPointerVA` | `0x2846E84` | 含义由 `hookMode` 决定；`YMRevokeHookModeX86Callsite` 下填写原消息查询 `call` 指令的 VA |
+| `revokeX86Callsite` | N/A | x86 callsite 的 `svrId/session/result flag` 偏移；详细灰条字段未确认时可单独留 0 |
 | `rawMessageTemplateVA` | `0x7A7AD88` | 撤回 MessageWrap 模板数据（被 memcpy 616 字节） |
 | `messageWrapFromRawVA` | `0x482F54C` | 由 raw 构造 MessageWrap 的函数 |
 | `messageWrapDestructVA` | `0x2123AC0` | MessageWrap 析构函数 |
 | `insertPaySysMsgToSessionVA` | `0x38EBBFC` | 插入本地 type=10000 系统消息的函数 |
 | `YMMultiOpenTryPreventMultiInstanceVA` | `0x1C4EA8` | 防多开判断函数（patch 成返回 YES） |
 
-> `layout`（MessageWrap 字段偏移）大概率与 arm64 相同（同源结构体），但运行后若灰条乱码/插错会话，需重新核对。
+> 不要假定新版 `layout` 与旧版或 arm64 相同。4.1.12 已证明结果标志和 context 字段均有漂移；
+> 未确认的详细提示字段应保持为 `0`，让核心防撤回独立工作。
 
 ## 逆向方法（命令行已验证可行）
 

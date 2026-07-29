@@ -103,6 +103,19 @@ typedef struct {
     size_t contentOffset;
 } YMMessageWrapLayout;
 
+// x86_64 的撤回原消息查询调用点及返回对象布局会随微信版本漂移。
+// 防撤回只依赖前三项；后四项仅用于可选的详细灰条提示。
+typedef struct {
+    size_t svrIdOffset;
+    size_t sessionOffset;
+    size_t resultHasValueOffset;
+
+    size_t originTypeOffset;
+    size_t originCreateTimeMsOffset;
+    size_t originCreateTimeSecOffset;
+    size_t originContentOffset;
+} YMRevokeX86CallsiteLayout;
+
 #pragma mark - 微信版本适配配置
 
 /*
@@ -149,6 +162,7 @@ typedef struct {
     // 候选(WeChatIntercept 笔记, x86_64 4.1.x)：0x4ecbb60（CMessageWrap 路径, msg 在 rsi/a1）。
     uintptr_t emojiMsgHandlerVA;
 
+    YMRevokeX86CallsiteLayout revokeX86Callsite;
     YMMessageWrapLayout layout;
 
     YMRevokeHookMode hookMode;//4.1.10添加
@@ -362,13 +376,8 @@ static const YMWeChatAdaptProfile YMAdaptProfiles[] = {
 
 /*
  x86_64 地址表。
- ⚠️ 下面所有 VA 都标记为 0，是 Phase 2 待逆向的占位值：
-    需要在 wechat.dylib 的 x86_64 切片里重新定位每个函数 / 指令点的静态 VA。
- 在地址填好之前：
-   - YMProfileHasValidAddresses 会因为关键地址为 0 返回 NO，
-     所以防撤回 / 退群在 x86_64 上会被安全跳过，不会崩。
-   - 多开 patch 读到 0 地址也会打印 "address is zero, skip"。
- 逆向顺序建议：多开 -> 防撤回函数入口 -> 退群监控 + inline callsite。
+ 4.1.10 已完成防撤回、详细提示和多开；4.1.12 已完成防撤回和详细提示。
+ 每个 profile 中未逆向的功能地址保持为 0，相应安装路径会安全跳过。
  */
 static const YMWeChatAdaptProfile YMAdaptProfiles[] = {
     {
@@ -427,6 +436,17 @@ static const YMWeChatAdaptProfile YMAdaptProfiles[] = {
         //   (0x4ecc900 是跳到 helper 0x4ecb150 的 thunk，非本函数。)
         .emojiMsgHandlerVA = 0x4ecc910,
 
+        .revokeX86Callsite = {
+            .svrIdOffset = 0x168,
+            .sessionOffset = 0x188,
+            .resultHasValueOffset = 0x268,
+
+            .originTypeOffset = 264,
+            .originCreateTimeMsOffset = 256,
+            .originCreateTimeSecOffset = 276,
+            .originContentOffset = 304,
+        },
+
         // 布局与 arm64 一致（LP64 同一套 C++ ABI），运行期日志再二次确认。
         .layout = {
             .messageWrapSize = 616,
@@ -438,6 +458,64 @@ static const YMWeChatAdaptProfile YMAdaptProfiles[] = {
             .createTimeSecOffset = 276,
 
             .contentOffset = 328,
+        },
+    },
+
+    {
+        .displayName = "Mac WeChat 4.1.12 x86_64 / 269340",
+
+        .bundleID = "com.tencent.xinWeChat",
+        .shortVersion = "4.1.12",
+        .buildVersion = "269340",
+
+        // CoReplaceOriginMessageByRevoke(0x3433c90) 中查询原消息的唯一调用点：
+        //   0x34346bf mov rdx,[rbp-0x670]
+        //   0x34346c6 mov rcx,[rdx+0x198]   ; svrId
+        //   0x34346cd add rdx,0x1b8         ; session std::string*
+        //   0x34346d4 lea rdi,[rbp-0x948]   ; outWrap
+        //   0x34346db call 0x300cfe0        ; lookup
+        .hookMode = YMRevokeHookModeX86Callsite,
+        .hookPointerVA = 0x34346DB,
+
+        // 详细灰条插入函数：入口保存 rsi=session、rdx=content，忽略 rdi；随后构造
+        // type=10000 MessageWrap 和 0x8a331c0 的 `<sysmsg ... CDATA>` 模板。
+        .rawMessageTemplateVA = 0,
+        .messageWrapFromRawVA = 0,
+        .messageWrapDestructVA = 0,
+        .insertPaySysMsgToSessionVA = 0x43E41B0,
+
+        .YMMultiOpenTryPreventMultiInstanceVA = 0,
+        .YMGetMainWeixinProcessCountVA = 0,
+
+        .groupExitDBApplyVA = 0,
+        .groupExitFMessagePreVA = 0,
+        .groupExitUpdateSessionCacheVA = 0,
+        .groupExitMemberDataListVA = 0,
+        .groupExitChatroomInfoOperatorVA = 0,
+
+        .revokeOriginCallsiteAfterQueryVA = 0,
+        .revokeOriginCallsiteContinueVA = 0,
+        .revokeOriginCallsiteZeroBranchVA = 0,
+        .revokeDeleteMessagesVA = 0,
+
+        .openURLWebViewKindVA = 0,
+        .emojiMsgHandlerVA = 0,
+
+        .revokeX86Callsite = {
+            .svrIdOffset = 0x198,
+            .sessionOffset = 0x1B8,
+            .resultHasValueOffset = 0x270,
+
+            // CMessageWrap::SetMsgType 同时写 +0x0c 和 +0x108；灰条构造函数还确认
+            // timeMs/content/timeSec 分别位于 +0x100/+0x130/+0x114。
+            .originTypeOffset = 0x108,
+            .originCreateTimeMsOffset = 0x100,
+            .originCreateTimeSecOffset = 0x114,
+            .originContentOffset = 0x130,
+        },
+
+        .layout = {
+            .messageWrapSize = 624,
         },
     },
 };
@@ -749,10 +827,13 @@ static BOOL YMProfileHasAntiRevokeAddresses(const YMWeChatAdaptProfile *profile)
         return profile->hookPointerVA != 0;
     }
 
-    // X86Callsite：换查原消息的 call 目标。需要 callsite VA + insert 函数(出原文提示)。
+    // X86Callsite：换查原消息的 call 目标。核心防撤回只需要调用点和三个布局偏移；
+    // insert 函数及原消息字段只影响可选的详细灰条提示。
     if (profile->hookMode == YMRevokeHookModeX86Callsite) {
         return profile->hookPointerVA != 0 &&
-               profile->insertPaySysMsgToSessionVA != 0;
+               profile->revokeX86Callsite.svrIdOffset != 0 &&
+               profile->revokeX86Callsite.sessionOffset != 0 &&
+               profile->revokeX86Callsite.resultHasValueOffset != 0;
     }
 
     BOOL baseOK = profile->rawMessageTemplateVA != 0 &&
@@ -4157,43 +4238,77 @@ static int64_t YMRevokeBlockNoticeHandler(int64_t a0, int64_t a1, int64_t a2,
 
 /*
  思路（对应 ARM 的 callsite hook，但用更安全的"换 call 目标"实现）：
- x86 CoReplaceOriginMessageByRevoke(0x2f93440) 里查原消息：
+ x86 4.1.10 CoReplaceOriginMessageByRevoke(0x2f93440) 里查原消息：
    0x2f93e95 mov rdx,[rbp-0x660]         ; rdx = extObject(ctx)，svrId@+0x168 session@+0x188
    0x2f93e9c mov rcx,[rdx+0x168]         ; rcx = svrId
    0x2f93ea3 add rdx,0x188              ; rdx = ctx+0x188(session 串地址)
    0x2f93eaa lea rdi,[rbp-0x910]         ; rdi = outWrap(被填充的原消息 wrap)
    0x2f93eb1 call 0x2ba12c0              ; 查到原消息，填入 outWrap
  把这条 call 的目标(rel32)改成下面的 wrapper：先调真正的查询拿到原消息，
- 再从 outWrap/extObject 捕获 content/type/time/session(偏移与 arm64 一致)，
- 插入带原文的详细灰条，最后把 outWrap+616 的"替换标志"清 0 阻止 UI 替换。
+ 再清掉 outWrap 的"替换标志"阻止 UI 替换。调用点和结果布局由 profile 描述；
+ 如果该版本还确认了 content/type/time/insert 地址，再额外插入带原文的详细灰条。
  整条 callsite 唯一，天然只在撤回时触发；不需要寄存器保存跳板。
 */
 static uintptr_t YMRevokeX86RealLookupAddr = 0;
 typedef int64_t (*YMRevokeX86LookupFunc)(int64_t,int64_t,int64_t,int64_t,int64_t,int64_t);
 
-static void YMRevokeX86CaptureFromCoReplace(uintptr_t outWrap, uintptr_t extObject, uint64_t svrId) {
-    if (outWrap == 0 || extObject == 0) {
+static void YMRevokeX86CaptureFromCoReplace(uintptr_t outWrap,
+                                            uintptr_t sessionStringAddress,
+                                            uint64_t svrId) {
+    const YMWeChatAdaptProfile *profile = YMGetActiveProfile();
+    if (!profile || outWrap == 0) {
         return;
     }
 
-    // 原消息是否有效：outWrap+616 == 1 表示这次确实替换了原消息。
+    const YMRevokeX86CallsiteLayout *layout = &profile->revokeX86Callsite;
+    if (layout->resultHasValueOffset == 0) {
+        return;
+    }
+
+    // 1 表示查询拿到了将用于替换 UI 的原消息。先清标志，保证后续可选提示解析
+    // 即使失败，也不会影响核心防撤回。
     uint8_t hasValue = 0;
-    YMSafeReadMemory(outWrap + 616, &hasValue, sizeof(hasValue));
-    if (hasValue == 0) {
+    if (!YMSafeReadMemory(outWrap + layout->resultHasValueOffset,
+                          &hasValue,
+                          sizeof(hasValue)) || hasValue != 1) {
+        return;
+    }
+    *((volatile uint8_t *)(outWrap + layout->resultHasValueOffset)) = 0;
+
+    YMLog(@"[X86Callsite] preserved origin svrId=%llu sessionPtr=0x%lx flagOffset=0x%lx",
+          (unsigned long long)svrId,
+          (unsigned long)sessionStringAddress,
+          (unsigned long)layout->resultHasValueOffset);
+
+    BOOL detailedNoticeReady =
+        sessionStringAddress != 0 &&
+        profile->insertPaySysMsgToSessionVA != 0 &&
+        layout->originTypeOffset != 0 &&
+        layout->originCreateTimeMsOffset != 0 &&
+        layout->originCreateTimeSecOffset != 0 &&
+        layout->originContentOffset != 0;
+    if (!detailedNoticeReady) {
+        YMLog(@"[X86Callsite] detailed notice unavailable for profile=%s; origin message is still preserved",
+              profile->displayName ?: "");
         return;
     }
 
     uint32_t originType = 0;
     uint64_t originCreateTimeMs = 0;
     uint32_t originCreateTimeSec = 0;
-    YMSafeReadMemory(outWrap + 264, &originType, sizeof(originType));
-    YMSafeReadMemory(outWrap + 256, &originCreateTimeMs, sizeof(originCreateTimeMs));
-    YMSafeReadMemory(outWrap + 276, &originCreateTimeSec, sizeof(originCreateTimeSec));
+    YMSafeReadMemory(outWrap + layout->originTypeOffset, &originType, sizeof(originType));
+    YMSafeReadMemory(outWrap + layout->originCreateTimeMsOffset,
+                     &originCreateTimeMs,
+                     sizeof(originCreateTimeMs));
+    YMSafeReadMemory(outWrap + layout->originCreateTimeSecOffset,
+                     &originCreateTimeSec,
+                     sizeof(originCreateTimeSec));
 
     // 用 ->c_str() 路径(YMNSStringFromStdString)读，YMNSStringFromLibcppStringObject 在
     // x86 上对这些 std::string 解析为空(实测 session 用 c_str 能拿到 wxid，用它则空)。
-    NSString *originContent = YMNSStringFromStdString((std::string *)(outWrap + 304));
-    std::string *sessionString = (std::string *)(extObject + 392);
+    NSString *originContent = YMNSStringFromStdString(
+        (std::string *)(outWrap + layout->originContentOffset));
+    std::string *sessionString = (std::string *)sessionStringAddress;
     NSString *sessionText = YMNSStringFromStdString(sessionString);
 
     YMLog(@"[X86Callsite] origin captured svrId=%llu type=%u session=%@ contentLen=%lu",
@@ -4213,13 +4328,9 @@ static void YMRevokeX86CaptureFromCoReplace(uintptr_t outWrap, uintptr_t extObje
                                                @"",            // replaceMsg
                                                @"",            // msgID
                                                @"");           // newMsgID
-
-    // 关键：清掉"替换原消息"的标志，阻止后续 UI 把原消息替换成撤回提示。
-    // outWrap 已校验非空且 hasValue 读取成功，是合法可写内存，直接写。
-    *((volatile uint8_t *)(outWrap + 616)) = 0;
 }
 
-// 换 call 目标后的 wrapper：rdi=outWrap, rdx=extObject+0x188, rcx=svrId。
+// 换 call 目标后的 wrapper：rdi=outWrap, rdx=session std::string*, rcx=svrId。
 static int64_t YMRevokeX86LookupWrapper(int64_t a0, int64_t a1, int64_t a2,
                                         int64_t a3, int64_t a4, int64_t a5) {
     int64_t result = 0;
@@ -4232,7 +4343,7 @@ static int64_t YMRevokeX86LookupWrapper(int64_t a0, int64_t a1, int64_t a2,
         @autoreleasepool {
             try {
                 YMRevokeX86CaptureFromCoReplace((uintptr_t)a0,
-                                                (uintptr_t)a2 - 0x188,
+                                                (uintptr_t)a2,
                                                 (uint64_t)a3);
             } catch (...) {
                 YMLog(@"[X86Callsite] capture exception");
@@ -4243,23 +4354,56 @@ static int64_t YMRevokeX86LookupWrapper(int64_t a0, int64_t a1, int64_t a2,
     return result;
 }
 
-// 把 0x2f93eb1 处 `E8 rel32` 的目标改成 wrapper；rel32 必须 32 位可达。
-static BOOL YMPatchRevokeX86Callsite(uintptr_t slide, uintptr_t callSiteVA) {
-    if (callSiteVA == 0) {
+// 把 profile 指定的 `E8 rel32` 目标改成 wrapper；rel32 必须 32 位可达。
+static BOOL YMPatchRevokeX86Callsite(uintptr_t slide,
+                                     const YMWeChatAdaptProfile *profile) {
+    if (!profile || profile->hookPointerVA == 0) {
         return NO;
     }
-    uintptr_t callAddr = slide + callSiteVA;
+    uintptr_t callAddr = slide + profile->hookPointerVA;
 
-    uint8_t opcode = 0;
-    YMSafeReadMemory(callAddr, &opcode, 1);
-    if (opcode != 0xE8) {
-        YMLog(@"[X86Callsite] install failed: not a call(E8) at 0x%lx, op=0x%02x",
-              (unsigned long)callAddr, opcode);
+    // 补丁前验证调用点前四条参数准备指令及两个版本化字段偏移。
+    // 这能阻止旧 VA 恰好落在另一条 E8 上时误改无关调用。
+    uint8_t fingerprint[29] = {0};
+    if (!YMSafeReadMemory(callAddr - 28, fingerprint, sizeof(fingerprint))) {
+        YMLog(@"[X86Callsite] install failed: cannot read fingerprint at 0x%lx",
+              (unsigned long)(callAddr - 28));
+        return NO;
+    }
+
+    const uint8_t movStackPrefix[] = {0x48, 0x8B, 0x95};
+    const uint8_t movSvrIdPrefix[] = {0x48, 0x8B, 0x8A};
+    const uint8_t addSessionPrefix[] = {0x48, 0x81, 0xC2};
+    const uint8_t leaOutPrefix[] = {0x48, 0x8D, 0xBD};
+    uint32_t encodedSvrIdOffset = 0;
+    uint32_t encodedSessionOffset = 0;
+    memcpy(&encodedSvrIdOffset, fingerprint + 10, sizeof(encodedSvrIdOffset));
+    memcpy(&encodedSessionOffset, fingerprint + 17, sizeof(encodedSessionOffset));
+
+    BOOL fingerprintOK =
+        memcmp(fingerprint + 0, movStackPrefix, sizeof(movStackPrefix)) == 0 &&
+        memcmp(fingerprint + 7, movSvrIdPrefix, sizeof(movSvrIdPrefix)) == 0 &&
+        memcmp(fingerprint + 14, addSessionPrefix, sizeof(addSessionPrefix)) == 0 &&
+        memcmp(fingerprint + 21, leaOutPrefix, sizeof(leaOutPrefix)) == 0 &&
+        fingerprint[28] == 0xE8 &&
+        encodedSvrIdOffset == profile->revokeX86Callsite.svrIdOffset &&
+        encodedSessionOffset == profile->revokeX86Callsite.sessionOffset;
+    if (!fingerprintOK) {
+        YMLog(@"[X86Callsite] install failed: callsite fingerprint mismatch at 0x%lx (svr=0x%x/0x%lx session=0x%x/0x%lx)",
+              (unsigned long)callAddr,
+              encodedSvrIdOffset,
+              (unsigned long)profile->revokeX86Callsite.svrIdOffset,
+              encodedSessionOffset,
+              (unsigned long)profile->revokeX86Callsite.sessionOffset);
         return NO;
     }
 
     int32_t oldRel = 0;
-    YMSafeReadMemory(callAddr + 1, &oldRel, sizeof(oldRel));
+    if (!YMSafeReadMemory(callAddr + 1, &oldRel, sizeof(oldRel))) {
+        YMLog(@"[X86Callsite] install failed: cannot read call rel32 at 0x%lx",
+              (unsigned long)callAddr);
+        return NO;
+    }
     YMRevokeX86RealLookupAddr = callAddr + 5 + (intptr_t)oldRel;
 
     intptr_t newRel = (intptr_t)&YMRevokeX86LookupWrapper - (intptr_t)(callAddr + 5);
@@ -5234,9 +5378,9 @@ static BOOL YMPatchAntiRevokeWithSlide(intptr_t slide, NSString *source) {
     } else if (profile->hookMode == YMRevokeHookModeX86Callsite) {
         /*
          x86_64：换 CoReplace 里查原消息那条 call 的目标 → wrapper 捕获原文+清替换标志。
-         hookPointerVA 存的是那条 call 指令的 VA(0x2f93eb1)。
+         hookPointerVA 存的是那条 call 指令的 VA，安装前会校验参数准备指令指纹。
         */
-        ok = YMPatchRevokeX86Callsite((uintptr_t)slide, profile->hookPointerVA);
+        ok = YMPatchRevokeX86Callsite((uintptr_t)slide, profile);
     } else {
         YMLog(@"unknown revoke hook mode: %d", profile->hookMode);
         ok = NO;
